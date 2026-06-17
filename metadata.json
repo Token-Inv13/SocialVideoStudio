@@ -1,0 +1,6 @@
+{
+  "name": "Social Video Studio",
+  "description": "An advanced AI-powered video generator and script writer for YouTube, Shorts, Reels, and TikTok, using Google Gen AI APIs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
