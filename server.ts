@@ -1,6 +1,6 @@
 import express from "express";
 import path from "path";
-import app from "./app";
+import app from "./app.js";
 const PORT = Number(process.env.PORT ?? 3000);
 // Serve static assets and mount Vite middleware
 async function startServer() {
