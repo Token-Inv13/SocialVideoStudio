@@ -54,9 +54,20 @@ function getSimulatedVideoStatus(operationName: string) {
 }
 
 app.post("/api/generate-script", async (req, res) => {
+  let stage = "init";
   try {
+    stage = "parse_request";
     const { topic, contentType, targetPlatform, tone, brandVoice, referenceImage } = req.body;
+    console.log("[generate-script] request received", {
+      hasTopic: Boolean(topic),
+      contentType,
+      targetPlatform,
+      tone,
+      hasBrandVoice: Boolean(brandVoice),
+      hasReferenceImage: Boolean(referenceImage)
+    });
 
+    stage = "build_prompt";
     const basePrompt = `Write a video scripting storyboard about "${topic}".
 Category/Format details:
 - Content Category: ${contentType || "General Storytelling"}
@@ -70,6 +81,7 @@ Your goal is to optimize the script structure:
 - If format is "YouTube (16:9)", structure the narrative as a compelling 3-act story (Introduction/Hook, Deep Dive/Conflict, Resolution/Outro). Keep durations around 10-15 seconds per scene for pacing.
 - For each scene, write detailed image/video generation prompts (Visual prompts for GenAI models like Veo). Describe specific physical objects, lighting (e.g. dramatic volumetric light, cinematic golden hour), colors, actions, and specific camera styles (e.g., pan left, slow zoom-in, macro lens). Include audio directions (music/voice tones) and exactly what gets spoken. Use english for visual prompts so the video models understand them correctly.`;
 
+    stage = "init_client";
     const ai = getGenAI();
     const contents: any[] = [basePrompt];
 
@@ -85,6 +97,7 @@ Your goal is to optimize the script structure:
       }
     }
 
+    stage = "call_gemini";
     const response = await ai.models.generateContent({
       model: "gemini-2.0-flash",
       contents,
@@ -120,11 +133,24 @@ Your goal is to optimize the script structure:
       }
     });
 
+    stage = "parse_response";
     const data = JSON.parse(response.text || "{}");
+    console.log("[generate-script] response parsed", {
+      hasText: Boolean(response.text),
+      sceneCount: Array.isArray(data?.scenes) ? data.scenes.length : 0
+    });
     res.json(data);
   } catch (error: any) {
-    console.error("Script generation error:", error);
-    res.status(500).json({ error: error.message || "Failed to generate script" });
+    console.error("[generate-script] failed", {
+      stage,
+      name: error?.name,
+      message: error?.message,
+      stack: error?.stack
+    });
+    res.status(500).json({
+      error: error?.message || "Failed to generate script",
+      stage
+    });
   }
 });
 
