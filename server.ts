@@ -1,7 +1,7 @@
 import express from "express";
 import path from "path";
 import dotenv from "dotenv";
-import { GoogleGenAI, GenerateVideosOperation, Type } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 
 dotenv.config();
 
@@ -20,29 +20,29 @@ function getGenAI() {
   if (!aiInstance) {
     aiInstance = new GoogleGenAI({
       apiKey: key,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build",
-        },
-      },
     });
   }
   return aiInstance;
 }
 
-// Keep a simple in-memory simulation state for polling when sandbox mode is active
-interface SimulatedOperation {
-  id: string;
-  sceneId: string;
-  visualPrompt: string;
-  aspectRatio: string;
-  progress: number;
-}
-const simulatedOperations: Record<string, SimulatedOperation> = {};
-
 // Helper to determine if we can make actual AI calls
 function isGeminiConfigured() {
   return !!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY";
+}
+
+// Stateless Simulation Helpers
+function createSimulatedOpId(prompt: string = "") {
+  const timestamp = Date.now();
+  const hash = Buffer.from(prompt).toString("base64").substring(0, 16);
+  return `sim-${timestamp}-${hash}`;
+}
+
+function parseSimulatedOpId(opId: string) {
+  const parts = opId.split("-");
+  if (parts.length < 3) return null;
+  const timestamp = parseInt(parts[1]);
+  const hash = parts[2];
+  return { timestamp, hash };
 }
 
 // API Routes FIRST
@@ -372,78 +372,35 @@ app.post("/api/generate-scene-image", async (req, res) => {
 // 3. Real Veo / Simulated Video Generation Start (POST)
 app.post("/api/generate-video", async (req, res) => {
   try {
-    const { prompt, aspectRatio, sceneId, referenceImage, simulate } = req.body;
-
-    const opId = `op-${Math.random().toString(36).substr(2, 9)}`;
+    const { prompt, aspectRatio, simulate } = req.body;
 
     if (simulate || !isGeminiConfigured()) {
-      // Store a simulated operation progress monitor
-      simulatedOperations[opId] = {
-        id: opId,
-        sceneId: sceneId || "generic-scene",
-        visualPrompt: prompt || "Abstract particles in visual stream",
-        aspectRatio: aspectRatio || "16:9",
-        progress: 0
-      };
-
+      const opId = createSimulatedOpId(prompt);
       return res.json({ operationName: `models/veo-3.1-lite-generate-preview/operations/${opId}`, isSimulated: true });
     }
 
     try {
-      // Real API Call with @google/genai as documented in Veo Guidelines
       const ai = getGenAI();
-      
-      let resolution = "720p"; // default lite supports up to 1080p but 720p is fast !
-      
       const config: any = {
         numberOfVideos: 1,
-        resolution,
+        resolution: "720p",
         aspectRatio: aspectRatio === "9:16" ? "9:16" : "16:9"
       };
 
-      let operation;
-
-      if (referenceImage) {
-        // Image-to-Video Workflow
-        const match = referenceImage.match(/^data:(image\/\w+);base64,(.+)$/);
-        if (match) {
-          operation = await ai.models.generateVideos({
-            model: "veo-3.1-lite-generate-preview",
-            prompt: prompt || "Bring this scene to life with natural cinematic fluid motion",
-            image: {
-              imageBytes: match[2],
-              mimeType: match[1]
-            },
-            config
-          });
-        } else {
-          throw new Error("Invalid reference image format. Must be base64 data URI.");
-        }
-      } else {
-        // Text-to-Video Workflow
-        operation = await ai.models.generateVideos({
-          model: "veo-3.1-lite-generate-preview",
-          prompt: prompt || "A cinematic scenic flow",
-          config
-        });
-      }
+      const operation = await ai.models.generateVideos({
+        model: "veo-3.1-lite-generate-preview",
+        prompt: prompt || "A cinematic scenic flow",
+        config
+      });
 
       res.json({ operationName: operation.name, isSimulated: false });
     } catch (veoError: any) {
-      console.warn("Real Veo generation failed (e.g. Quota/rate-limit error). Auto-falling back to resilient simulation mode:", veoError.message || veoError);
-      
-      simulatedOperations[opId] = {
-        id: opId,
-        sceneId: sceneId || "generic-scene",
-        visualPrompt: prompt || "Abstract particles in visual stream",
-        aspectRatio: aspectRatio || "16:9",
-        progress: 0
-      };
-
+      console.warn("Real Veo generation failed:", veoError.message);
+      const opId = createSimulatedOpId(prompt);
       res.json({ 
         operationName: `models/veo-3.1-lite-generate-preview/operations/${opId}`, 
         isSimulated: true,
-        warning: `Limite de quota Veo ou sature-limit active : ${veoError.message || "quota épuisé"}. Passage automatique en simulation de rendu.`
+        warning: `Mode simulation activé suite à une erreur API.`
       });
     }
   } catch (error: any) {
@@ -461,38 +418,31 @@ app.post("/api/video-status", async (req, res) => {
     }
 
     // Check if simulated
-    if (operationName.includes("/operations/op-")) {
-      const match = operationName.match(/\/operations\/(op-\w+)/);
+    if (operationName.includes("/operations/sim-")) {
+      const match = operationName.match(/\/operations\/(sim-\w+-\w+)/);
       const opId = match ? match[1] : "";
-      const sOp = simulatedOperations[opId];
-      if (!sOp) {
-        return res.json({ done: true, progress: 100, error: "Operation not found" });
+      const parsed = parseSimulatedOpId(opId);
+      
+      if (!parsed) {
+        return res.json({ done: true, progress: 100, error: "Invalid simulated operation" });
       }
 
-      sOp.progress += 25; // simulate progress incremental increases
-      if (sOp.progress >= 100) {
-        sOp.progress = 100;
-        return res.json({ done: true, progress: 100 });
-      }
+      const elapsed = Date.now() - parsed.timestamp;
+      const progress = Math.min(100, Math.floor((elapsed / 20000) * 100)); // 20 seconds simulation
 
-      return res.json({ done: false, progress: sOp.progress });
+      return res.json({ done: progress >= 100, progress });
     }
 
     try {
-      // Real API polling
       const ai = getGenAI();
-      const op = new GenerateVideosOperation();
-      op.name = operationName;
-      const updated = await ai.operations.getVideosOperation({ operation: op });
-      
-      // Veo does not supply fractional progress but we can state done/pending
+      const updated = await ai.operations.get(operationName);
       res.json({ done: updated.done, response: updated.response });
     } catch (pollError: any) {
-      console.warn("Polling real operation failed (e.g. Rate limit or quota error while waiting for Veo). Auto-simulating complete state:", pollError.message || pollError);
+      console.warn("Polling error:", pollError.message);
       res.json({ 
         done: true, 
         isSimulated: true,
-        warning: `Erreur d'interrogation API : ${pollError.message || "quota épuisé"}. Rendu simulé finalisé.`
+        warning: `Erreur d'interrogation API. Affichage de la simulation.`
       });
     }
   } catch (error: any) {
@@ -509,11 +459,9 @@ app.all("/api/video-download", async (req, res) => {
       return res.status(400).json({ error: "operationName is required" });
     }
 
-    // Handle simulation fallback stream or link with high-quality theme-derived video routing
-    if (operationName.includes("/operations/op-")) {
-      const match = operationName.match(/\/operations\/(op-\w+)/);
+    if (operationName.includes("/operations/sim-")) {
+      const match = operationName.match(/\/operations\/(sim-\w+-\w+)/);
       const opId = match ? match[1] : "";
-      const sOp = simulatedOperations[opId];
       
       const fallbackVideos = [
         "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4",
@@ -521,113 +469,47 @@ app.all("/api/video-download", async (req, res) => {
         "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
         "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4",
         "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerMeltdowns.mp4",
-        "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/SubaruOutbackOnStreetAndDirt.mp4"
       ];
       
-      let videoUrl = fallbackVideos[0];
-      if (opId.includes("fun")) {
-        videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4";
-      } else if (opId.includes("joy")) {
-        videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4";
-      } else if (opId.includes("blaze")) {
-        videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4";
-      } else if (opId.includes("escape")) {
-        videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4";
-      } else if (sOp && sOp.visualPrompt) {
-        const text = sOp.visualPrompt.toLowerCase();
-        if (text.includes("car") || text.includes("vehicle") || text.includes("road") || text.includes("drive") || text.includes("street")) {
-          videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/SubaruOutbackOnStreetAndDirt.mp4";
-        } else if (text.includes("fire") || text.includes("burn") || text.includes("hot") || text.includes("neon") || text.includes("circuit") || text.includes("glow")) {
-          videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4";
-        } else if (text.includes("escape") || text.includes("nature") || text.includes("rain") || text.includes("green") || text.includes("forest")) {
-          videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4";
-        } else if (text.includes("tech") || text.includes("robot") || text.includes("code") || text.includes("smart") || text.includes("cyber")) {
-          videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4";
-        } else if (text.includes("joy") || text.includes("sunset") || text.includes("happy") || text.includes("gold") || text.includes("apartment")) {
-          videoUrl = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4";
-        } else {
-          // Semi-random deterministic mapping so each scene index stays unique
-          const hash = opId.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
-          videoUrl = fallbackVideos[hash % fallbackVideos.length];
-        }
-      } else {
-        const hash = opId.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
-        videoUrl = fallbackVideos[hash % fallbackVideos.length];
-      }
-      // Helper function to robustly download video files, with user agent headers and secure fallbacks
+      const hash = opId.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
+      const videoUrl = fallbackVideos[hash % fallbackVideos.length];
+
       async function fetchVideoAsBuffer(url: string): Promise<{ buf: Buffer; contentType: string }> {
-        const headers = {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          "Accept": "*/*"
-        };
-        try {
-          const vres = await fetch(url, { headers });
-          if (vres.ok) {
-            const ab = await vres.arrayBuffer();
-            return { buf: Buffer.from(ab), contentType: vres.headers.get("Content-Type") || "video/mp4" };
-          }
-          console.warn(`Fetch to standard GCS URL returned status ${vres.status} for ${url}`);
-        } catch (err) {
-          console.error(`Fetch failed for standard GCS URL: ${url}`, err);
+        const headers = { "User-Agent": "Mozilla/5.0", "Accept": "*/*" };
+        const vres = await fetch(url, { headers });
+        if (vres.ok) {
+          const ab = await vres.arrayBuffer();
+          return { buf: Buffer.from(ab), contentType: vres.headers.get("Content-Type") || "video/mp4" };
         }
-
-        // Extremely reliable public backup streams for development sandbox simulation
-        const backups = [
-          "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4",
-          "https://www.w3schools.com/html/movie.mp4",
-          "https://www.w3schools.com/html/mov_bbb.mp4"
-        ];
-        for (const bUrl of backups) {
-          try {
-            console.log(`Trying fallback backup stream URL: ${bUrl}`);
-            const vres = await fetch(bUrl, { headers });
-            if (vres.ok) {
-              const ab = await vres.arrayBuffer();
-              return { buf: Buffer.from(ab), contentType: vres.headers.get("Content-Type") || "video/mp4" };
-            }
-          } catch (err) {
-            console.error(`Backup fetch failed for ${bUrl}:`, err);
-          }
-        }
-        throw new Error("All public simulation video fetch URL endpoints failed.");
+        throw new Error("Failed to fetch simulation video.");
       }
 
-      // Instead of returning res.redirect directly, which can trigger iframe sandbox and CORS blocks (ReferenceError for WritableStream),
-      // we stream the content on the server side under the same local origin for seamless playback and downloads.
       try {
         const { buf, contentType } = await fetchVideoAsBuffer(videoUrl);
         res.setHeader("Content-Type", contentType);
         res.setHeader("Content-Length", buf.length);
-        if (req.query.download === "true") {
-          res.setHeader("Content-Disposition", `attachment; filename="scene_${opId || "video"}.mp4"`);
-        }
         res.send(buf);
         return;
       } catch (streamErr) {
-        console.error("Streaming/buffer error for simulation video:", streamErr);
-        res.status(500).json({ error: "Failed to load simulation video files." });
+        res.status(500).json({ error: "Failed to load simulation video." });
         return;
       }
     }
 
     const ai = getGenAI();
-    const op = new GenerateVideosOperation();
-    op.name = operationName;
-    
-    const updated = await ai.operations.getVideosOperation({ operation: op });
+    const updated = await ai.operations.get(operationName);
     const uri = updated.response?.generatedVideos?.[0]?.video?.uri;
     
     if (!uri) {
-      return res.status(404).json({ error: "Video uri not found yet. Is generation done?" });
+      return res.status(404).json({ error: "Video uri not found yet." });
     }
 
-    const apiKey = process.env.GEMINI_API_KEY;
     const videoRes = await fetch(uri, {
-      headers: { "x-goog-api-key": apiKey || "" }
+      headers: { "x-goog-api-key": process.env.GEMINI_API_KEY || "" }
     });
 
     if (!videoRes.ok) {
-      return res.status(videoRes.status).json({ error: `Failed to fetch video from Veo API: ${videoRes.statusText}` });
+      return res.status(videoRes.status).json({ error: "Failed to fetch video from API." });
     }
 
     const ab = await videoRes.arrayBuffer();
@@ -635,15 +517,11 @@ app.all("/api/video-download", async (req, res) => {
 
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Length", buf.length);
-    if (req.query.download === "true") {
-      res.setHeader("Content-Disposition", `attachment; filename="veo_compiled_video.mp4"`);
-    }
-
     res.send(buf);
     return;
   } catch (error: any) {
-    console.error("Video download streaming error:", error);
-    res.status(500).json({ error: error.message || "Failed to download/stream Veo video file" });
+    console.error("Video download error:", error);
+    res.status(500).json({ error: error.message || "Failed to download video" });
   }
 });
 
