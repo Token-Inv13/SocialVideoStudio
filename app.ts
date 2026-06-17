@@ -57,8 +57,11 @@ app.post("/api/generate-script", async (req, res) => {
   let stage = "init";
   try {
     stage = "parse_request";
+    const diagMode =
+      typeof req.query.diag === "string" ? req.query.diag : undefined;
     const { topic, contentType, targetPlatform, tone, brandVoice, referenceImage } = req.body;
     console.log("[generate-script] request received", {
+      diagMode,
       hasTopic: Boolean(topic),
       contentType,
       targetPlatform,
@@ -66,6 +69,10 @@ app.post("/api/generate-script", async (req, res) => {
       hasBrandVoice: Boolean(brandVoice),
       hasReferenceImage: Boolean(referenceImage)
     });
+
+    if (diagMode === "echo") {
+      return res.json({ ok: true, stage: "echo" });
+    }
 
     stage = "build_prompt";
     const basePrompt = `Write a video scripting storyboard about "${topic}".
@@ -83,6 +90,11 @@ Your goal is to optimize the script structure:
 
     stage = "init_client";
     const ai = getGenAI();
+
+    if (diagMode === "client") {
+      return res.json({ ok: true, stage: "client" });
+    }
+
     const contents: any[] = [basePrompt];
 
     if (referenceImage) {
@@ -95,6 +107,19 @@ Your goal is to optimize the script structure:
           }
         });
       }
+    }
+
+    if (diagMode === "simple") {
+      stage = "call_gemini_simple";
+      const simpleResponse = await ai.models.generateContent({
+        model: "gemini-2.0-flash",
+        contents: "Reply with the single word OK."
+      });
+      return res.json({
+        ok: true,
+        stage: "simple",
+        text: simpleResponse.text
+      });
     }
 
     stage = "call_gemini";
