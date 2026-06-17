@@ -363,6 +363,8 @@ export default function App() {
         body: JSON.stringify({
           prompt: scene.visualPrompt,
           aspectRatio: targetPlatform === "youtube" ? "16:9" : "9:16",
+          model: selectedModel,
+          durationSeconds: scene.duration,
           sceneId: scene.id,
           referenceImage: index === 0 ? referenceImage : null,
           simulate: simulateInSandbox
@@ -492,6 +494,8 @@ export default function App() {
             body: JSON.stringify({
               prompt: sc.visualPrompt,
               aspectRatio: targetPlatform === "youtube" ? "16:9" : "9:16",
+              model: selectedModel,
+              durationSeconds: sc.duration,
               sceneId: sc.id,
               referenceImage: index === 0 ? referenceImage : null,
               simulate: simulateInSandbox

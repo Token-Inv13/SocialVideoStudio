@@ -1,4 +1,5 @@
 import express from "express";
+import { randomUUID } from "crypto";
 import path from "path";
 import dotenv from "dotenv";
 import { GoogleGenAI, Type } from "@google/genai";
@@ -6,7 +7,9 @@ import { GoogleGenAI, Type } from "@google/genai";
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT ?? 3000);
+const SANDBOX_VIDEO_URL = "https://www.w3schools.com/html/mov_bbb.mp4";
+const simulatedOperations = new Map<string, { readyAt: number }>();
 
 app.use(express.json({ limit: "50mb" }));
 
@@ -23,6 +26,34 @@ function getGenAI() {
     });
   }
   return aiInstance;
+}
+
+function createSimulatedVideoOperation(durationSeconds?: number) {
+  const operationName = `/operations/mock-${randomUUID()}`;
+  const readyDelay = Math.max(2500, Math.min(12000, (durationSeconds ?? 8) * 600));
+  simulatedOperations.set(operationName, { readyAt: Date.now() + readyDelay });
+  return operationName;
+}
+
+function getSimulatedVideoStatus(operationName: string) {
+  const record = simulatedOperations.get(operationName);
+  if (!record) return null;
+
+  const done = Date.now() >= record.readyAt;
+  return {
+    done,
+    response: done
+      ? {
+          generatedVideos: [
+            {
+              video: {
+                uri: SANDBOX_VIDEO_URL
+              }
+            }
+          ]
+        }
+      : undefined
+  };
 }
 
 // API Routes
@@ -116,22 +147,18 @@ app.post("/api/generate-scene-image", async (req, res) => {
     if (aspectRatio === "9:16") geminiAspectRatio = "9:16";
     else if (aspectRatio === "16:9") geminiAspectRatio = "16:9";
 
-    const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
-      contents: {
-        parts: [{ text: prompt }]
+    const response = await ai.models.generateImages({
+      model: "imagen-4.0-generate-001",
+      prompt,
+      config: {
+        numberOfImages: 1
       }
     });
 
-    // Extracting image from response if supported by model
-    let imageUrl = "";
-    const parts = response.candidates?.[0]?.content?.parts || [];
-    for (const part of parts) {
-      if (part.inlineData) {
-        imageUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-        break;
-      }
-    }
+    const generatedImage = response.generatedImages?.[0]?.image;
+    const imageUrl = generatedImage?.imageBytes
+      ? `data:${generatedImage.mimeType || "image/png"};base64,${generatedImage.imageBytes}`
+      : "";
 
     if (!imageUrl) {
       throw new Error("No image was returned from the generator model.");
@@ -147,18 +174,37 @@ app.post("/api/generate-scene-image", async (req, res) => {
 // 3. Video Generation Start
 app.post("/api/generate-video", async (req, res) => {
   try {
-    const { prompt, aspectRatio } = req.body;
+    const { prompt, aspectRatio, model, referenceImage, durationSeconds, simulate } = req.body;
+
+    if (simulate) {
+      return res.json({ operationName: createSimulatedVideoOperation(durationSeconds) });
+    }
 
     const ai = getGenAI();
+    let image;
+    if (referenceImage) {
+      const match = referenceImage.match(/^data:(image\/\w+);base64,(.+)$/);
+      if (match) {
+        image = {
+          mimeType: match[1],
+          imageBytes: match[2]
+        } as any;
+      }
+    }
+
     const config: any = {
       numberOfVideos: 1,
       resolution: "720p",
       aspectRatio: aspectRatio === "9:16" ? "9:16" : "16:9"
     };
+    if (typeof durationSeconds === "number" && Number.isFinite(durationSeconds)) {
+      config.durationSeconds = durationSeconds;
+    }
 
     const operation = await ai.models.generateVideos({
-      model: "veo-3.1-lite-generate-preview",
+      model: model || "veo-3.1-lite-generate-preview",
       prompt: prompt || "A cinematic scenic flow",
+      image,
       config
     });
 
@@ -177,8 +223,15 @@ app.post("/api/video-status", async (req, res) => {
       return res.status(400).json({ error: "operationName is required" });
     }
 
+    const simulated = getSimulatedVideoStatus(operationName);
+    if (simulated) {
+      return res.json(simulated);
+    }
+
     const ai = getGenAI();
-    const updated = await ai.operations.get(operationName);
+    const updated = await ai.operations.getVideosOperation({
+      operation: { name: operationName } as any
+    });
     res.json({ done: updated.done, response: updated.response });
   } catch (error: any) {
     console.error("Polling error:", error);
@@ -194,11 +247,23 @@ app.all("/api/video-download", async (req, res) => {
       return res.status(400).json({ error: "operationName is required" });
     }
 
+    if (simulatedOperations.has(operationName)) {
+      return res.redirect(302, SANDBOX_VIDEO_URL);
+    }
+
     const ai = getGenAI();
-    const updated = await ai.operations.get(operationName);
+    const updated = await ai.operations.getVideosOperation({
+      operation: { name: operationName } as any
+    });
     const uri = updated.response?.generatedVideos?.[0]?.video?.uri;
     
     if (!uri) {
+      if (
+        operationName.startsWith("/operations/op-demo-") ||
+        operationName === "/operations/op-compiled-film"
+      ) {
+        return res.redirect(302, "https://www.w3schools.com/html/mov_bbb.mp4");
+      }
       return res.status(404).json({ error: "Video uri not found yet." });
     }
 
