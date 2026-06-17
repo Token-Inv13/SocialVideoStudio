@@ -309,8 +309,10 @@ async function startServer() {
   });
 }
 
-// Only start the server if not running on Vercel
-if (!process.env.VERCEL) {
+const entryPoint = process.argv[1] ?? "";
+const isMainModule = entryPoint.endsWith("server.ts") || entryPoint.endsWith("server.cjs");
+
+if (isMainModule) {
   startServer();
 }
 
