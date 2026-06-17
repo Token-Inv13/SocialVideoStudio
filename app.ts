@@ -7,6 +7,7 @@ dotenv.config();
 
 const app = express();
 const SANDBOX_VIDEO_URL = "https://www.w3schools.com/html/mov_bbb.mp4";
+const SCRIPT_MODEL = "gemini-2.5-flash";
 const simulatedOperations = new Map<string, { readyAt: number }>();
 
 app.use(express.json({ limit: "50mb" }));
@@ -112,7 +113,7 @@ Your goal is to optimize the script structure:
     if (diagMode === "simple") {
       stage = "call_gemini_simple";
       const simpleResponse = await ai.models.generateContent({
-        model: "gemini-2.0-flash",
+        model: SCRIPT_MODEL,
         contents: "Reply with the single word OK."
       });
       return res.json({
@@ -124,7 +125,7 @@ Your goal is to optimize the script structure:
 
     stage = "call_gemini";
     const response = await ai.models.generateContent({
-      model: "gemini-2.0-flash",
+      model: SCRIPT_MODEL,
       contents,
       config: {
         systemInstruction,
