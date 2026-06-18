@@ -23,6 +23,7 @@ export interface ScriptScene {
   // App state attributes
   isGeneratingVideo?: boolean;
   isGeneratingImage?: boolean;
+  isSimulated?: boolean;
   videoUrl?: string;
   imageUrl?: string;
   operationName?: string;

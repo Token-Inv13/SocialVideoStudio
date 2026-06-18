@@ -60,19 +60,20 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState("veo-3.1-lite-generate-preview");
   const [resolution, setResolution] = useState("720p");
   const [coherence, setCoherence] = useState(85);
-  const [simulateInSandbox, setSimulateInSandbox] = useState(true);
+  const [simulateInSandbox, setSimulateInSandbox] = useState(false);
 
   // App running states
   const [isGeneratingScript, setIsGeneratingScript] = useState(false);
   const [script, setScript] = useState<VideoScript | null>(null);
   const [selectedSceneIndex, setSelectedSceneIndex] = useState<number>(0);
+  const [previewMode, setPreviewMode] = useState<"scene" | "final">("scene");
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackTime, setPlaybackTime] = useState(0);
   const [renderProgress, setRenderProgress] = useState<Record<string, number>>({});
   const [activePollers, setActivePollers] = useState<Record<string, boolean>>({});
-  const [isCompilingVideo, setIsCompilingVideo] = useState(false);
-  const [compilationProgress, setCompilationProgress] = useState(0);
-  const [compiledVideoUrl, setCompiledVideoUrl] = useState<string | null>(null);
+  const [assembledVideoUrl, setAssembledVideoUrl] = useState<string | null>(null);
+  const [isAssemblingFinalVideo, setIsAssemblingFinalVideo] = useState(false);
+  const [assemblyError, setAssemblyError] = useState<string | null>(null);
 
   // Error/Alert logs
   const [errorStatus, setErrorStatus] = useState<string | null>(null);
@@ -113,6 +114,120 @@ export default function App() {
   // Interactive Validation states
   const [valJsonInput, setValJsonInput] = useState(JSON.stringify(MOCK_MARKETING_STORYBOARD_JSON_INSTANCE, null, 2));
   const [valResult, setValResult] = useState<{ success: boolean; text: string } | null>(null);
+  const projectCompletionAnnouncedRef = useRef(false);
+  const assemblySignatureRef = useRef<string | null>(null);
+  const totalSceneCount = script?.scenes.length ?? 0;
+  const completedSceneCount = script?.scenes.filter((scene) => Boolean(scene.videoUrl)).length ?? 0;
+  const failedSceneCount = script?.scenes.filter((scene) => Boolean(scene.error)).length ?? 0;
+  const isProjectRendering = script?.scenes.some((scene) => scene.isGeneratingVideo) ?? false;
+  const isProjectReady = totalSceneCount > 0 && completedSceneCount === totalSceneCount;
+  const activeScene: ScriptScene | undefined = script?.scenes[selectedSceneIndex];
+  const isFinalVideoReady = Boolean(assembledVideoUrl);
+  const displayedVideoUrl =
+    previewMode === "final" && assembledVideoUrl ? assembledVideoUrl : activeScene?.videoUrl;
+  const finalVideoDownloadUrl = assembledVideoUrl ?? null;
+  const readySceneDownloadUrl = script?.scenes[selectedSceneIndex]?.videoUrl
+    ? `${script.scenes[selectedSceneIndex].videoUrl}&download=true`
+    : null;
+
+  const resetFinalAssemblyState = () => {
+    setPreviewMode("scene");
+    setAssembledVideoUrl(null);
+    setAssemblyError(null);
+    setIsAssemblingFinalVideo(false);
+    assemblySignatureRef.current = null;
+  };
+
+  const getAssemblySignature = (targetScript: VideoScript) =>
+    targetScript.scenes
+      .map((scene) => scene.operationName || scene.videoUrl || scene.id)
+      .join("|");
+
+  const assembleProjectVideo = async (targetScript: VideoScript, forcedSignature?: string) => {
+    const clips = targetScript.scenes
+      .map((scene) => ({
+        sceneId: scene.id,
+        operationName: scene.operationName,
+        videoUrl: scene.videoUrl,
+      }))
+      .filter((scene) => scene.operationName || scene.videoUrl);
+
+    if (clips.length !== targetScript.scenes.length) {
+      return;
+    }
+
+    const assemblySignature = forcedSignature || getAssemblySignature(targetScript);
+    assemblySignatureRef.current = assemblySignature;
+    setIsAssemblingFinalVideo(true);
+    setAssemblyError(null);
+    setPreviewMode("final");
+    addLog(`Assemblage final en cours pour ${clips.length} clips...`);
+
+    try {
+      const response = await fetch("/api/assemble-video", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: targetScript.title,
+          clips,
+        }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || `Assemble API returned error ${response.status}`);
+      }
+
+      setAssembledVideoUrl(data.videoUrl);
+      setPreviewMode("final");
+      addLog(`Vidéo finale prête (${data.storage === "blob" ? "stockée" : "session locale"}).`);
+    } catch (err: any) {
+      assemblySignatureRef.current = null;
+      setAssemblyError(err.message);
+      setPreviewMode("scene");
+      addLog(`ERREUR assemblage final: ${err.message}`);
+    } finally {
+      setIsAssemblingFinalVideo(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!script?.scenes.length) return;
+
+    const activeScene = script.scenes[selectedSceneIndex];
+    if (!activeScene?.videoUrl) {
+      const firstReadySceneIndex = script.scenes.findIndex((scene) => Boolean(scene.videoUrl));
+      if (firstReadySceneIndex >= 0 && firstReadySceneIndex !== selectedSceneIndex) {
+        setSelectedSceneIndex(firstReadySceneIndex);
+      }
+    }
+
+    const completedCount = script.scenes.filter((scene) => Boolean(scene.videoUrl)).length;
+    const allScenesSettled = script.scenes.every((scene) => scene.videoUrl || scene.error);
+
+    if (allScenesSettled && completedCount === script.scenes.length && !projectCompletionAnnouncedRef.current) {
+      projectCompletionAnnouncedRef.current = true;
+      addLog(
+        simulateInSandbox
+          ? "Projet terminé en mode sandbox. Les aperçus sont des clips de démonstration identiques par conception."
+          : "Projet terminé. Tous les clips générés sont prêts au visionnage."
+      );
+    }
+  }, [script, selectedSceneIndex, simulateInSandbox]);
+
+  useEffect(() => {
+    if (!script?.scenes.length) return;
+    if (isAssemblingFinalVideo) return;
+    if (!isProjectReady) return;
+    if (script.scenes.some((scene) => scene.error)) return;
+
+    const assemblySignature = getAssemblySignature(script);
+    if (assemblySignatureRef.current === assemblySignature && (assembledVideoUrl || assemblyError)) {
+      return;
+    }
+
+    void assembleProjectVideo(script, assemblySignature);
+  }, [script, isAssemblingFinalVideo, isProjectReady, assembledVideoUrl, assemblyError]);
 
   const handleValidateJson = (inputStr: string) => {
     try {
@@ -249,9 +364,8 @@ export default function App() {
     try {
       setIsGeneratingScript(true);
       setErrorStatus(null);
-      setCompiledVideoUrl(null);
-      setCompilationProgress(0);
-      setIsCompilingVideo(false);
+      projectCompletionAnnouncedRef.current = false;
+      resetFinalAssemblyState();
       addLog(`Lancement de l'écriture intelligente du script: "${topic}"...`);
 
       const response = await fetch("/api/generate-script", {
@@ -272,12 +386,23 @@ export default function App() {
       }
 
       const data: VideoScript = await response.json();
-      setScript(data);
+      const hydratedScript: VideoScript = {
+        ...data,
+        isSimulated: simulateInSandbox,
+        scenes: data.scenes.map((scene) => ({
+          ...scene,
+          isSimulated: simulateInSandbox,
+          videoUrl: undefined,
+          operationName: undefined,
+          error: undefined
+        }))
+      };
+      setScript(hydratedScript);
       setSelectedSceneIndex(0);
-      addLog(`Script généré avec succès ! Titre : "${data.title}". Lancement automatique du rendu vidéo Google Veo...`);
+      addLog(`Script généré avec succès ! Titre : "${hydratedScript.title}". Lancement automatique du rendu vidéo Google Veo...`);
       
       // Auto-initiate video generation for all scenes simultaneously
-      generateAllVideos(data);
+      generateAllVideos(hydratedScript);
     } catch (err: any) {
       console.error(err);
       setErrorStatus("Erreur lors de la génération du script. Assurez-vous que l'API key est valide.");
@@ -340,6 +465,7 @@ export default function App() {
   const generateSceneVideo = async (index: number) => {
     if (!script) return;
     const scene = script.scenes[index];
+    resetFinalAssemblyState();
 
     // Set interactive loader
     setScript((prev) => {
@@ -349,7 +475,8 @@ export default function App() {
         ...updated[index],
         isGeneratingVideo: true,
         error: undefined,
-        videoUrl: undefined
+        videoUrl: undefined,
+        isSimulated: simulateInSandbox
       };
       return { ...prev, scenes: updated };
     });
@@ -464,6 +591,8 @@ export default function App() {
   // 5. Autogenerate/Render all elements in sequence (All script content workflow)
   const generateAllVideos = async (targetScript: VideoScript) => {
     if (!targetScript || !targetScript.scenes) return;
+    projectCompletionAnnouncedRef.current = false;
+    resetFinalAssemblyState();
     addLog("Lancement simultané du rendu vidéo Veo pour l'ensemble des scènes...");
 
     // Set all scenes to generating state at once
@@ -471,10 +600,11 @@ export default function App() {
       ...scene,
       isGeneratingVideo: true,
       error: undefined,
-      videoUrl: undefined
+      videoUrl: undefined,
+      isSimulated: simulateInSandbox
     }));
 
-    setScript({ ...targetScript, scenes: updatedScenes });
+    setScript({ ...targetScript, isSimulated: simulateInSandbox, scenes: updatedScenes });
 
     // Set initial progress bars
     const initialProgress: Record<string, number> = {};
@@ -540,60 +670,15 @@ export default function App() {
     }
   };
 
-  // Keeping legacy handler pointing to automated runner for safety
-  const renderEntireStoryboard = async () => {
-    if (script) {
-      await generateAllVideos(script);
-    }
-  };
-
-  // Handle movie compilation with real visual progression & direct same-origin download resolution
-  const compileVideoAndSolder = async () => {
-    if (!script) return;
-    
-    // Check if at least some videos are generated
-    const hasAnyVideo = script.scenes.some(s => s.videoUrl);
-    if (!hasAnyVideo) {
-      addLog("AVERTISSEMENT: Aucune scène n'a été générée en vidéo. Générez les scènes d'abord !");
-      alert("Veuillez d'abord générer au moins une scène vidéo Veo avant de lancer la compilation globale.");
-      return;
-    }
-
-    addLog("Initialisation de la compilation du film final 1080p...");
-    setIsCompilingVideo(true);
-    setCompilationProgress(5);
-    setCompiledVideoUrl(null);
-
-    // Simulated cloud merge worker
-    let currentProgress = 5;
-    const interval = setInterval(() => {
-      currentProgress += Math.floor(Math.random() * 15) + 5;
-      if (currentProgress >= 100) {
-        currentProgress = 100;
-        clearInterval(interval);
-        
-        // Find first available video URL or use a general fallback
-        const existingVideo = script.scenes.find(s => s.videoUrl)?.videoUrl;
-        
-        // Use the same-origin proxy download endpoint with download format
-        const finalUrl = existingVideo || "/api/video-download?operationName=/operations/op-compiled-film";
-        setCompiledVideoUrl(finalUrl);
-        setIsCompilingVideo(false);
-        setCompilationProgress(100);
-        addLog("Compilation 1080p terminée avec succès ! Le film complet est prêt.");
-      } else {
-        setCompilationProgress(currentProgress);
-      }
-    }, 350);
-  };
-
   // Demo auto loader helper so the screen is never uninspired
   const loadExampleScript = () => {
+    resetFinalAssemblyState();
     const defaultData: VideoScript = {
       title: "Révolution Robotique 2026",
       brandVoiceApplied: "TechPulse (Direct, fascinant, basé sur la science)",
       formatType: "shorts",
       overallMood: "dynamic",
+      isSimulated: true,
       scenes: [
         {
           id: "sc-1",
@@ -603,6 +688,7 @@ export default function App() {
           cameraMovement: "Macro slow pan revealing carbon fiber joints",
           textOverlay: "L'IA PHYSIQUE COMMENCE ICI",
           audioCue: "Deep sub-base swoop, electronic swell starting slow",
+          isSimulated: true,
           videoUrl: "/api/video-download?operationName=/operations/op-demo-fun"
         },
         {
@@ -613,6 +699,7 @@ export default function App() {
           cameraMovement: "Tracking shot, low-angle moving slowly right to left",
           textOverlay: "ASSISTANTS AUTONOMES 🤖",
           audioCue: "Synthesizer pad playing warm cinematic notes",
+          isSimulated: true,
           videoUrl: "/api/video-download?operationName=/operations/op-demo-joyrides"
         },
         {
@@ -623,6 +710,7 @@ export default function App() {
           cameraMovement: "Fast camera fly-through following the light streams",
           textOverlay: "LA GRANDE FUSION TECHNIQUE",
           audioCue: "Intense synth build-up, punchy beat drops",
+          isSimulated: true,
           videoUrl: "/api/video-download?operationName=/operations/op-demo-blazes"
         }
       ]
@@ -631,8 +719,6 @@ export default function App() {
     setSelectedSceneIndex(0);
     addLog("Exemple de production chargé dans l'espace de travail.");
   };
-
-  const activeScene: ScriptScene | undefined = script?.scenes[selectedSceneIndex];
 
   return (
     <div id="app-root" className="bg-[#050505] text-zinc-300 font-sans min-h-screen flex flex-col overflow-hidden selection:bg-indigo-600 selection:text-white">
@@ -688,41 +774,46 @@ export default function App() {
             <div className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.7)] animate-ping"></div>
             <span className="text-xs font-mono uppercase tracking-widest text-emerald-400 font-semibold">Gemini + Veo Connectés</span>
           </div>
-          {compiledVideoUrl ? (
-            <div className="flex items-center gap-2">
-              <button
-                onClick={compileVideoAndSolder}
-                className="bg-zinc-900 hover:bg-zinc-800 text-zinc-300 border border-white/5 px-3 py-2 rounded-lg text-xs font-semibold transition-all cursor-pointer"
-                title="Re-compiler la vidéo complète"
-              >
-                Re-compiler
-              </button>
+          <div className="flex items-center gap-3">
+            {script && (
+              <div className="bg-zinc-900/80 px-3 py-1.5 rounded-full border border-white/5">
+                <span className="text-xs font-mono uppercase tracking-widest text-zinc-300 font-semibold">
+                  {isAssemblingFinalVideo
+                    ? "Assemblage final..."
+                    : assembledVideoUrl
+                    ? "Vidéo finale prête"
+                    : isProjectReady
+                    ? `Projet prêt ${completedSceneCount}/${totalSceneCount}`
+                    : isProjectRendering
+                    ? `Rendu auto ${completedSceneCount}/${totalSceneCount}`
+                    : failedSceneCount > 0
+                    ? `Projet partiel ${completedSceneCount}/${totalSceneCount}`
+                    : `Storyboard ${completedSceneCount}/${totalSceneCount}`}
+                </span>
+              </div>
+            )}
+            {finalVideoDownloadUrl ? (
               <a
-                href={`${compiledVideoUrl}&download=true`}
-                download="film_complet_vgen.mp4"
+                href={finalVideoDownloadUrl}
+                download={`${script?.title || "video-finale"}.mp4`}
                 className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg text-xs font-bold transition-all shadow-lg active:scale-95 flex items-center gap-1.5 cursor-pointer"
-                id="download-final-movie-btn"
+                id="download-final-video-btn"
               >
-                <Download className="w-3.5 h-3.5 animate-bounce" />
-                Télécharger le Film Complet
+                <Download className="w-3.5 h-3.5" />
+                Télécharger la Vidéo Finale
               </a>
-            </div>
-          ) : isCompilingVideo ? (
-            <div className="bg-indigo-950/40 border border-indigo-500/20 rounded-lg px-4 py-2 flex items-center gap-2.5 text-indigo-300 text-xs font-semibold min-w-[140px] justify-center">
-              <div className="w-3 h-3 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin"></div>
-              <span>Rendu final : {compilationProgress}%</span>
-            </div>
-          ) : (
-            <button
-              onClick={compileVideoAndSolder}
-              disabled={!script}
-              className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg text-xs font-semibold transition-all shadow-lg active:scale-95 flex items-center gap-1.5 cursor-pointer"
-              id="render-4k-final-btn"
-            >
-              <Layers className="w-3.5 h-3.5" />
-              Compiler la Vidéo
-            </button>
-          )}
+            ) : readySceneDownloadUrl && (
+              <a
+                href={readySceneDownloadUrl}
+                download={`scene_${selectedSceneIndex + 1}_video.mp4`}
+                className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-lg text-xs font-bold transition-all shadow-lg active:scale-95 flex items-center gap-1.5 cursor-pointer"
+                id="download-active-video-btn"
+              >
+                <Download className="w-3.5 h-3.5" />
+                Télécharger le Clip Actif
+              </a>
+            )}
+          </div>
         </div>
       </header>
 
@@ -1148,7 +1239,9 @@ export default function App() {
                               />
                               <div>
                                 <span className="text-[10px] uppercase font-bold text-zinc-300 block">Environnement Sandbox</span>
-                                <p className="text-[9px] text-zinc-500 mb-0">Évite les coûts d&apos;API réels</p>
+                                <p className="text-[9px] text-zinc-500 mb-0">
+                                  Utilise un clip de démo identique sur chaque scène pour éviter les coûts réels
+                                </p>
                               </div>
                             </label>
                           </div>
@@ -1184,7 +1277,9 @@ export default function App() {
                             </div>
                             <div className="flex justify-between">
                               <span className="text-zinc-500">Consommation API</span>
-                              <span className="text-emerald-400 font-mono font-bold">Inclus (Sandbox)</span>
+                              <span className={`font-mono font-bold ${simulateInSandbox ? "text-amber-400" : "text-emerald-400"}`}>
+                                {simulateInSandbox ? "Sandbox (démo)" : "Mode réel"}
+                              </span>
                             </div>
                             <div className="flex justify-between">
                               <span className="text-zinc-500">Hébergement GPU</span>
@@ -1290,6 +1385,28 @@ export default function App() {
                 
                 {/* Active scene video frame aspect model */}
                 <div className="w-full flex flex-col items-center">
+                  {(isFinalVideoReady || isAssemblingFinalVideo) && (
+                    <div className="mb-3 flex items-center gap-2 rounded-full border border-white/10 bg-zinc-950/80 p-1">
+                      <button
+                        type="button"
+                        onClick={() => setPreviewMode("final")}
+                        className={`px-3 py-1.5 rounded-full text-[11px] font-semibold transition-colors cursor-pointer ${
+                          previewMode === "final" ? "bg-indigo-600 text-white" : "text-zinc-400 hover:text-zinc-200"
+                        }`}
+                      >
+                        Vidéo Finale
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPreviewMode("scene")}
+                        className={`px-3 py-1.5 rounded-full text-[11px] font-semibold transition-colors cursor-pointer ${
+                          previewMode === "scene" ? "bg-zinc-800 text-white" : "text-zinc-400 hover:text-zinc-200"
+                        }`}
+                      >
+                        Clip de Scène
+                      </button>
+                    </div>
+                  )}
                   <div
                     className={`relative bg-[#0b0b0b] rounded-2xl border border-white/10 overflow-hidden shadow-2xl transition-all duration-300 group flex items-center justify-center ${
                       targetPlatform === "youtube"
@@ -1298,7 +1415,7 @@ export default function App() {
                     }`}
                   >
                     {/* Render status bar */}
-                    {activeScene?.isGeneratingVideo && (
+                    {previewMode === "scene" && activeScene?.isGeneratingVideo && (
                       <div className="absolute inset-0 bg-black/90 z-20 flex flex-col items-center justify-center p-6 text-center">
                         <div className="relative w-16 h-16 mb-4 flex items-center justify-center">
                           <div className="absolute inset-0 border-4 border-indigo-600/25 rounded-full"></div>
@@ -1321,8 +1438,22 @@ export default function App() {
                       </div>
                     )}
 
+                    {previewMode === "final" && isAssemblingFinalVideo && !assembledVideoUrl && (
+                      <div className="absolute inset-0 bg-black/90 z-20 flex flex-col items-center justify-center p-6 text-center">
+                        <div className="relative w-16 h-16 mb-4 flex items-center justify-center">
+                          <div className="absolute inset-0 border-4 border-indigo-600/25 rounded-full"></div>
+                          <div className="absolute inset-0 border-4 border-t-indigo-500 border-r-indigo-500 rounded-full animate-spin"></div>
+                          <Layers className="w-6 h-6 text-indigo-400" />
+                        </div>
+                        <h4 className="text-sm font-semibold text-white">Assemblage Final</h4>
+                        <p className="text-xs text-zinc-500 mt-1 max-w-[220px]">
+                          Concaténation des clips du projet en une vidéo finale unique...
+                        </p>
+                      </div>
+                    )}
+
                     {/* Rendering image state */}
-                    {activeScene?.isGeneratingImage && !activeScene?.isGeneratingVideo && (
+                    {previewMode === "scene" && activeScene?.isGeneratingImage && !activeScene?.isGeneratingVideo && (
                       <div className="absolute inset-0 bg-black/90 z-20 flex flex-col items-center justify-center p-6 text-center">
                         <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin mb-3"></div>
                         <span className="text-xs text-zinc-400">Génération du concept image de storyboard...</span>
@@ -1330,10 +1461,10 @@ export default function App() {
                     )}
 
                     {/* Main media output display */}
-                    {activeScene?.videoUrl ? (
+                    {displayedVideoUrl ? (
                       <video
-                        key={activeScene.videoUrl}
-                        src={activeScene.videoUrl}
+                        key={displayedVideoUrl}
+                        src={displayedVideoUrl}
                         className="w-full h-full object-cover"
                         loop
                         muted
@@ -1347,11 +1478,16 @@ export default function App() {
                         <div className="w-14 h-14 bg-indigo-950/40 border border-indigo-500/20 rounded-full flex items-center justify-center mb-4 text-indigo-400 shadow-xl shadow-indigo-500/10">
                           <Video className="w-6 h-6 animate-pulse" />
                         </div>
-                        <span className="text-xs text-indigo-400 font-bold uppercase tracking-wider">Scène {selectedSceneIndex + 1}</span>
+                        <span className="text-xs text-indigo-400 font-bold uppercase tracking-wider">
+                          {previewMode === "final" ? "Vidéo Finale" : `Scène ${selectedSceneIndex + 1}`}
+                        </span>
                         <p className="text-[11px] text-zinc-400 mt-1.5 max-w-[245px] leading-relaxed">
-                          Le rendu vidéo (Veo) de cette scène n&apos;a pas encore été généré. Lancez l&apos;Animateur IA en un seul clic !
+                          {previewMode === "final"
+                            ? "La vidéo finale apparaîtra ici dès que l’assemblage backend sera terminé."
+                            : "Le rendu du projet est lancé automatiquement depuis le bouton principal. Ce panneau affichera le clip de la scène dès qu&apos;il sera prêt."}
                         </p>
 
+                        {previewMode === "scene" && sidebarMode === "expert" && (
                         <div className="mt-5">
                           <button
                             onClick={() => generateSceneVideo(selectedSceneIndex)}
@@ -1359,18 +1495,19 @@ export default function App() {
                             id="render-veo-video-btn"
                           >
                             <Sparkles className="w-3.5 h-3.5" />
-                            Générer la Vidéo de cette Scène
+                            Relancer ce Clip
                           </button>
                         </div>
+                        )}
                       </div>
                     )}
 
                     {/* Subtitle Teleprompter overlay overlay */}
-                    {activeScene && (
+                    {(previewMode === "final" ? script : activeScene) && (
                       <div className="absolute bottom-4 left-4 right-4 z-10 bg-black/80 backdrop-blur px-3 py-2.5 rounded-lg border border-white/5 text-center">
                         <span className="text-[10px] text-indigo-400 uppercase tracking-widest font-mono font-bold block mb-0.5">Captions & Incrustation :</span>
                         <p className="text-xs text-white font-medium tracking-wide">
-                          {activeScene.textOverlay || "Aucun texte"}
+                          {previewMode === "final" ? script?.title || "Vidéo Finale" : activeScene?.textOverlay || "Aucun texte"}
                         </p>
                       </div>
                     )}
@@ -1381,24 +1518,61 @@ export default function App() {
                 <div className="w-full bg-[#0a0a0a] border border-white/10 rounded-xl p-5 space-y-4">
                   <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-3 border-b border-white/5">
                     <div>
-                      <span className="text-[10px] text-zinc-500 uppercase tracking-widest font-mono">SCÈNE ACTIVE : {selectedSceneIndex + 1} / {script.scenes.length}</span>
+                      <span className="text-[10px] text-zinc-500 uppercase tracking-widest font-mono">
+                        {previewMode === "final" ? "VIDÉO FINALE" : `CLIP ACTIF : ${selectedSceneIndex + 1} / ${script.scenes.length}`}
+                      </span>
                       <h2 className="text-sm font-semibold text-white mt-0.5">{script.title}</h2>
                     </div>
                     <div className="flex flex-wrap gap-2">
-                      <button
-                        onClick={() => script && generateAllVideos(script)}
-                        className="bg-zinc-900 hover:bg-[#121212] hover:text-white text-zinc-300 text-xs px-3 py-1.5 rounded-lg border border-white/10 inline-flex items-center gap-1.5 cursor-pointer transition-colors"
-                      >
-                        <Layers className="w-3.5 h-3.5 text-indigo-400 animate-pulse" />
-                        Régénérer Tout le Projet
-                      </button>
-                      <button
-                        onClick={() => generateSceneVideo(selectedSceneIndex)}
-                        className="bg-zinc-900 hover:bg-[#121212] hover:text-white text-zinc-300 text-xs px-3 py-1.5 rounded-lg border border-white/10 inline-flex items-center gap-1.5 cursor-pointer transition-colors"
-                      >
-                        <Sparkles className="w-3.5 h-3.5 text-amber-500 animate-pulse" />
-                        Régénérer cette Scène
-                      </button>
+                      {assembledVideoUrl && (
+                        <button
+                          type="button"
+                          onClick={() => setPreviewMode("final")}
+                          className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3 py-1.5 rounded-lg inline-flex items-center gap-1.5 font-semibold cursor-pointer shadow-lg active:scale-95 transition-all"
+                        >
+                          <Play className="w-3.5 h-3.5 text-white" />
+                          Voir la Vidéo Finale
+                        </button>
+                      )}
+                      {previewMode === "final" && activeScene?.videoUrl && (
+                        <button
+                          type="button"
+                          onClick={() => setPreviewMode("scene")}
+                          className="bg-zinc-900 hover:bg-[#121212] hover:text-white text-zinc-300 text-xs px-3 py-1.5 rounded-lg border border-white/10 inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                        >
+                          <Video className="w-3.5 h-3.5 text-indigo-400" />
+                          Voir le Clip de Scène
+                        </button>
+                      )}
+                      {sidebarMode === "expert" && (
+                        <>
+                          <button
+                            onClick={() => script && generateAllVideos(script)}
+                            className="bg-zinc-900 hover:bg-[#121212] hover:text-white text-zinc-300 text-xs px-3 py-1.5 rounded-lg border border-white/10 inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                          >
+                            <Layers className="w-3.5 h-3.5 text-indigo-400 animate-pulse" />
+                            Relancer Tout le Projet
+                          </button>
+                          <button
+                            onClick={() => generateSceneVideo(selectedSceneIndex)}
+                            className="bg-zinc-900 hover:bg-[#121212] hover:text-white text-zinc-300 text-xs px-3 py-1.5 rounded-lg border border-white/10 inline-flex items-center gap-1.5 cursor-pointer transition-colors"
+                          >
+                            <Sparkles className="w-3.5 h-3.5 text-amber-500 animate-pulse" />
+                            Relancer ce Clip
+                          </button>
+                        </>
+                      )}
+                      {finalVideoDownloadUrl && (
+                        <a
+                          href={finalVideoDownloadUrl}
+                          download={`${script.title || "video-finale"}.mp4`}
+                          className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs px-3 py-1.5 rounded-lg inline-flex items-center gap-1.5 font-semibold cursor-pointer shadow-lg active:scale-95 transition-all"
+                          id="download-final-video-panel-btn"
+                        >
+                          <Download className="w-3.5 h-3.5 text-white" />
+                          Télécharger la Vidéo Finale
+                        </a>
+                      )}
                       {activeScene?.videoUrl && (
                         <a
                           href={`${activeScene.videoUrl}&download=true`}
@@ -1407,11 +1581,29 @@ export default function App() {
                           id="download-scene-video-btn"
                         >
                           <Download className="w-3.5 h-3.5 text-white" />
-                          Télécharger cette Scène
+                          Télécharger ce Clip
                         </a>
                       )}
                     </div>
                   </div>
+
+                  {simulateInSandbox && (
+                    <div className="bg-amber-950/20 border border-amber-700/30 text-amber-200 text-xs rounded-lg p-3">
+                      Mode sandbox actif : chaque scène réutilise volontairement le même clip de démonstration. Pour obtenir un rendu différent par scène, désactivez le sandbox avant de lancer la génération du projet.
+                    </div>
+                  )}
+
+                  {isAssemblingFinalVideo && (
+                    <div className="bg-indigo-950/20 border border-indigo-700/30 text-indigo-200 text-xs rounded-lg p-3">
+                      Assemblage backend en cours : les clips validés sont concaténés en une vidéo finale téléchargeable.
+                    </div>
+                  )}
+
+                  {assemblyError && (
+                    <div className="bg-red-950/20 border border-red-700/30 text-red-200 text-xs rounded-lg p-3">
+                      Échec de l’assemblage final : {assemblyError}
+                    </div>
+                  )}
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     {/* Prompt instructions section */}
@@ -1544,7 +1736,7 @@ export default function App() {
                     {scene.videoUrl ? (
                       <div className="absolute inset-0 bg-emerald-950/20 flex items-center justify-center text-[10px] text-emerald-400 font-mono font-bold">
                         <Check className="w-3.5 h-3.5 text-emerald-400 mr-1" />
-                        VIDÉO ok
+                        CLIP ok
                       </div>
                     ) : scene.imageUrl ? (
                       <img
@@ -1578,7 +1770,8 @@ export default function App() {
                         narration: "Et pour ne rater aucun des prochains hacks de création, rejoignez-nous maintenant.",
                         cameraMovement: "Zoom avant progressif",
                         textOverlay: "REJOIGNEZ LA RÉVOLUTION VEO",
-                        audioCue: "Fin enthousiaste avec impact musical et fade-out"
+                        audioCue: "Fin enthousiaste avec impact musical et fade-out",
+                        isSimulated: simulateInSandbox
                       }
                     ];
                     setScript({ ...script, scenes: updatedScenes });
@@ -1654,9 +1847,11 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => {
+                    resetFinalAssemblyState();
                     const mappedScript = {
                       title: MOCK_MARKETING_STORYBOARD_JSON_INSTANCE.metadata.title,
                       brandVoiceApplied: MOCK_MARKETING_STORYBOARD_JSON_INSTANCE.metadata.brand_voice_signature,
+                      isSimulated: true,
                       scenes: MOCK_MARKETING_STORYBOARD_JSON_INSTANCE.scenes.map(s => ({
                         id: s.id,
                         duration: s.duration,
@@ -1670,6 +1865,7 @@ export default function App() {
                           : s.id === "scene_02"
                           ? "https://images.unsplash.com/photo-1512941937669-90a1b58e7e9c?auto=format&fit=crop&w=500&q=80"
                           : "https://images.unsplash.com/photo-1498050108023-c5249f4df085?auto=format&fit=crop&w=500&q=80",
+                        isSimulated: true,
                         videoUrl: s.id === "scene_01"
                           ? "/api/video-download?operationName=/operations/op-demo-fun"
                           : undefined
@@ -1863,7 +2059,9 @@ export default function App() {
         <div className="flex gap-6">
           <span>REGION: europe-west2</span>
           <span className="hidden md:inline">SYSTEM: VE-ENGINE_PRO_v3.1</span>
-          <span className="text-indigo-400 font-semibold">SANDBOX ACTIVE</span>
+          <span className={`font-semibold ${simulateInSandbox ? "text-amber-400" : "text-emerald-400"}`}>
+            {simulateInSandbox ? "SANDBOX ACTIVE" : "REAL RENDER ACTIVE"}
+          </span>
         </div>
         <div className="flex gap-4">
           <span>MEMORY_FLOW: OPTIMIZED</span>

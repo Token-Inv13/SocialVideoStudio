@@ -1,7 +1,13 @@
 import express from "express";
 import { randomUUID } from "crypto";
+import { mkdir, readFile, rm, writeFile } from "fs/promises";
+import { tmpdir } from "os";
+import path from "path";
+import { spawn } from "child_process";
 import dotenv from "dotenv";
 import { GoogleGenAI, Type } from "@google/genai";
+import { put } from "@vercel/blob";
+import ffmpegPath from "ffmpeg-static";
 
 dotenv.config();
 
@@ -9,10 +15,22 @@ const app = express();
 const SANDBOX_VIDEO_URL = "https://www.w3schools.com/html/mov_bbb.mp4";
 const SCRIPT_MODEL = "gemini-2.5-flash";
 const simulatedOperations = new Map<string, { readyAt: number }>();
+const assembledArtifacts = new Map<
+  string,
+  { buffer: Buffer; createdAt: number; filename: string }
+>();
+const ASSEMBLED_ARTIFACT_TTL_MS = 30 * 60 * 1000;
 
 app.use(express.json({ limit: "50mb" }));
 
+type AssembleClipSource = {
+  operationName?: string;
+  videoUrl?: string;
+  sceneId?: string;
+};
+
 let aiInstance: GoogleGenAI | null = null;
+
 function getGenAI() {
   const key = process.env.GEMINI_API_KEY;
   if (!key || key === "MY_GEMINI_API_KEY") {
@@ -24,6 +42,15 @@ function getGenAI() {
     });
   }
   return aiInstance;
+}
+
+function cleanupAssembledArtifacts() {
+  const now = Date.now();
+  for (const [artifactId, artifact] of assembledArtifacts.entries()) {
+    if (now - artifact.createdAt > ASSEMBLED_ARTIFACT_TTL_MS) {
+      assembledArtifacts.delete(artifactId);
+    }
+  }
 }
 
 function createSimulatedVideoOperation(durationSeconds?: number) {
@@ -45,12 +72,198 @@ function getSimulatedVideoStatus(operationName: string) {
           generatedVideos: [
             {
               video: {
-                uri: SANDBOX_VIDEO_URL
-              }
-            }
-          ]
+                uri: SANDBOX_VIDEO_URL,
+              },
+            },
+          ],
         }
-      : undefined
+      : undefined,
+  };
+}
+
+function isDemoOperationName(operationName: string) {
+  return (
+    operationName.startsWith("/operations/op-demo-") ||
+    operationName === "/operations/op-compiled-film"
+  );
+}
+
+function getSafeFilename(baseName: string) {
+  const normalized = baseName
+    .normalize("NFKD")
+    .replace(/[^\w\s-]/g, "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .toLowerCase();
+
+  return normalized || "social-video-studio";
+}
+
+function getFfmpegBinaryPath() {
+  if (!ffmpegPath) {
+    throw new Error("ffmpeg-static binary is unavailable in this environment.");
+  }
+  return ffmpegPath;
+}
+
+async function fetchVideoBufferFromRemote(url: string, headers?: Record<string, string>) {
+  const videoRes = await fetch(url, headers ? { headers } : undefined);
+  if (!videoRes.ok) {
+    throw new Error(`Failed to fetch remote video asset (${videoRes.status}).`);
+  }
+
+  const ab = await videoRes.arrayBuffer();
+  return Buffer.from(ab);
+}
+
+async function downloadOperationVideo(operationName: string) {
+  if (simulatedOperations.has(operationName) || isDemoOperationName(operationName)) {
+    return fetchVideoBufferFromRemote(SANDBOX_VIDEO_URL);
+  }
+
+  const ai = getGenAI();
+  const updated = await ai.operations.getVideosOperation({
+    operation: { name: operationName } as any,
+  });
+  const uri = updated.response?.generatedVideos?.[0]?.video?.uri;
+
+  if (!uri) {
+    throw new Error(`Video uri not found for operation ${operationName}.`);
+  }
+
+  return fetchVideoBufferFromRemote(uri, {
+    "x-goog-api-key": process.env.GEMINI_API_KEY || "",
+  });
+}
+
+function extractOperationNameFromVideoUrl(videoUrl: string) {
+  try {
+    const parsed = new URL(videoUrl, "https://social-video-studio.local");
+    if (!parsed.pathname.includes("/api/video-download")) {
+      return null;
+    }
+    return parsed.searchParams.get("operationName");
+  } catch {
+    return null;
+  }
+}
+
+async function downloadClipSource(source: AssembleClipSource) {
+  if (source.operationName) {
+    return downloadOperationVideo(source.operationName);
+  }
+
+  if (!source.videoUrl) {
+    throw new Error("Each clip must include either operationName or videoUrl.");
+  }
+
+  const maybeOperationName = extractOperationNameFromVideoUrl(source.videoUrl);
+  if (maybeOperationName) {
+    return downloadOperationVideo(maybeOperationName);
+  }
+
+  if (/^https?:\/\//i.test(source.videoUrl)) {
+    return fetchVideoBufferFromRemote(source.videoUrl);
+  }
+
+  throw new Error(`Unsupported clip source: ${source.videoUrl}`);
+}
+
+async function runFfmpegConcat(inputPaths: string[], outputPath: string) {
+  const ffmpegBinary = getFfmpegBinaryPath();
+  const workingDir = path.dirname(outputPath);
+  const concatListPath = path.join(workingDir, "concat.txt");
+  const concatManifest = inputPaths
+    .map((inputPath) => `file '${inputPath.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`)
+    .join("\n");
+
+  await writeFile(concatListPath, concatManifest, "utf8");
+
+  await new Promise<void>((resolve, reject) => {
+    const ffmpeg = spawn(
+      ffmpegBinary,
+      [
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        concatListPath,
+        "-an",
+        "-vf",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-movflags",
+        "+faststart",
+        outputPath,
+      ],
+      {
+        cwd: workingDir,
+        stdio: ["ignore", "pipe", "pipe"],
+      }
+    );
+
+    let stderr = "";
+    ffmpeg.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    ffmpeg.on("error", (error) => {
+      reject(error);
+    });
+
+    ffmpeg.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(stderr || `ffmpeg exited with code ${code}`));
+    });
+  });
+}
+
+async function persistAssembledVideo(buffer: Buffer, title?: string) {
+  const filename = `${getSafeFilename(title || "vgen-final-video")}.mp4`;
+
+  if (process.env.BLOB_READ_WRITE_TOKEN) {
+    const blob = await put(`assembled/${filename}`, buffer, {
+      access: "public",
+      addRandomSuffix: true,
+      contentType: "video/mp4",
+    });
+
+    return {
+      videoUrl: blob.url,
+      storage: "blob" as const,
+      filename,
+    };
+  }
+
+  if (process.env.NODE_ENV === "production") {
+    throw new Error(
+      "BLOB_READ_WRITE_TOKEN is required in production to store the assembled final video."
+    );
+  }
+
+  cleanupAssembledArtifacts();
+  const artifactId = randomUUID();
+  assembledArtifacts.set(artifactId, {
+    buffer,
+    createdAt: Date.now(),
+    filename,
+  });
+
+  return {
+    videoUrl: `/api/assembled-video/${artifactId}`,
+    storage: "memory" as const,
+    filename,
   };
 }
 
@@ -68,7 +281,7 @@ app.post("/api/generate-script", async (req, res) => {
       targetPlatform,
       tone,
       hasBrandVoice: Boolean(brandVoice),
-      hasReferenceImage: Boolean(referenceImage)
+      hasReferenceImage: Boolean(referenceImage),
     });
 
     if (diagMode === "echo") {
@@ -104,8 +317,8 @@ Your goal is to optimize the script structure:
         contents.push({
           inlineData: {
             mimeType: match[1],
-            data: match[2]
-          }
+            data: match[2],
+          },
         });
       }
     }
@@ -114,12 +327,12 @@ Your goal is to optimize the script structure:
       stage = "call_gemini_simple";
       const simpleResponse = await ai.models.generateContent({
         model: SCRIPT_MODEL,
-        contents: "Reply with the single word OK."
+        contents: "Reply with the single word OK.",
       });
       return res.json({
         ok: true,
         stage: "simple",
-        text: simpleResponse.text
+        text: simpleResponse.text,
       });
     }
 
@@ -148,22 +361,22 @@ Your goal is to optimize the script structure:
                   narration: { type: Type.STRING },
                   cameraMovement: { type: Type.STRING },
                   textOverlay: { type: Type.STRING },
-                  audioCue: { type: Type.STRING }
+                  audioCue: { type: Type.STRING },
                 },
-                required: ["id", "duration", "visualPrompt", "narration", "cameraMovement", "textOverlay", "audioCue"]
-              }
-            }
+                required: ["id", "duration", "visualPrompt", "narration", "cameraMovement", "textOverlay", "audioCue"],
+              },
+            },
           },
-          required: ["title", "brandVoiceApplied", "formatType", "overallMood", "scenes"]
-        }
-      }
+          required: ["title", "brandVoiceApplied", "formatType", "overallMood", "scenes"],
+        },
+      },
     });
 
     stage = "parse_response";
     const data = JSON.parse(response.text || "{}");
     console.log("[generate-script] response parsed", {
       hasText: Boolean(response.text),
-      sceneCount: Array.isArray(data?.scenes) ? data.scenes.length : 0
+      sceneCount: Array.isArray(data?.scenes) ? data.scenes.length : 0,
     });
     res.json(data);
   } catch (error: any) {
@@ -171,11 +384,11 @@ Your goal is to optimize the script structure:
       stage,
       name: error?.name,
       message: error?.message,
-      stack: error?.stack
+      stack: error?.stack,
     });
     res.status(500).json({
       error: error?.message || "Failed to generate script",
-      stage
+      stage,
     });
   }
 });
@@ -192,8 +405,8 @@ app.post("/api/generate-scene-image", async (req, res) => {
       model: "imagen-4.0-generate-001",
       prompt,
       config: {
-        numberOfImages: 1
-      }
+        numberOfImages: 1,
+      },
     });
 
     const generatedImage = response.generatedImages?.[0]?.image;
@@ -227,7 +440,7 @@ app.post("/api/generate-video", async (req, res) => {
       if (match) {
         image = {
           mimeType: match[1],
-          imageBytes: match[2]
+          imageBytes: match[2],
         } as any;
       }
     }
@@ -235,7 +448,7 @@ app.post("/api/generate-video", async (req, res) => {
     const config: any = {
       numberOfVideos: 1,
       resolution: "720p",
-      aspectRatio: aspectRatio === "9:16" ? "9:16" : "16:9"
+      aspectRatio: aspectRatio === "9:16" ? "9:16" : "16:9",
     };
     if (typeof durationSeconds === "number" && Number.isFinite(durationSeconds)) {
       config.durationSeconds = durationSeconds;
@@ -245,7 +458,7 @@ app.post("/api/generate-video", async (req, res) => {
       model: model || "veo-3.1-lite-generate-preview",
       prompt: prompt || "A cinematic scenic flow",
       image,
-      config
+      config,
     });
 
     res.json({ operationName: operation.name });
@@ -269,13 +482,82 @@ app.post("/api/video-status", async (req, res) => {
 
     const ai = getGenAI();
     const updated = await ai.operations.getVideosOperation({
-      operation: { name: operationName } as any
+      operation: { name: operationName } as any,
     });
     res.json({ done: updated.done, response: updated.response });
   } catch (error: any) {
     console.error("Polling error:", error);
     res.status(500).json({ error: error.message || "Failed to poll operation status" });
   }
+});
+
+app.post("/api/assemble-video", async (req, res) => {
+  const tempDir = path.join(tmpdir(), `social-video-studio-${randomUUID()}`);
+
+  try {
+    const clips = Array.isArray(req.body?.clips) ? (req.body.clips as AssembleClipSource[]) : [];
+    const title =
+      typeof req.body?.title === "string" && req.body.title.trim()
+        ? req.body.title
+        : "social-video-studio-final";
+
+    if (clips.length === 0) {
+      return res.status(400).json({ error: "clips must contain at least one source." });
+    }
+
+    console.log("[assemble-video] start", {
+      clipCount: clips.length,
+      title,
+      hasBlobStorage: Boolean(process.env.BLOB_READ_WRITE_TOKEN),
+    });
+
+    await mkdir(tempDir, { recursive: true });
+
+    const inputPaths: string[] = [];
+    for (let index = 0; index < clips.length; index += 1) {
+      const buffer = await downloadClipSource(clips[index]);
+      const inputPath = path.join(tempDir, `scene-${String(index + 1).padStart(2, "0")}.mp4`);
+      await writeFile(inputPath, buffer);
+      inputPaths.push(inputPath);
+    }
+
+    const outputPath = path.join(tempDir, "assembled-final.mp4");
+    await runFfmpegConcat(inputPaths, outputPath);
+
+    const outputBuffer = await readFile(outputPath);
+    const storedVideo = await persistAssembledVideo(outputBuffer, title);
+
+    res.json({
+      ok: true,
+      clipCount: clips.length,
+      filename: storedVideo.filename,
+      storage: storedVideo.storage,
+      videoUrl: storedVideo.videoUrl,
+    });
+  } catch (error: any) {
+    console.error("[assemble-video] failed", {
+      message: error?.message,
+      stack: error?.stack,
+    });
+    res.status(500).json({
+      error: error?.message || "Failed to assemble final video.",
+    });
+  } finally {
+    await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+});
+
+app.get("/api/assembled-video/:artifactId", (req, res) => {
+  cleanupAssembledArtifacts();
+  const artifact = assembledArtifacts.get(req.params.artifactId);
+  if (!artifact) {
+    return res.status(404).json({ error: "Assembled video not found or expired." });
+  }
+
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Content-Length", artifact.buffer.length);
+  res.setHeader("Content-Disposition", `inline; filename="${artifact.filename}"`);
+  res.send(artifact.buffer);
 });
 
 app.all("/api/video-download", async (req, res) => {
@@ -285,40 +567,10 @@ app.all("/api/video-download", async (req, res) => {
       return res.status(400).json({ error: "operationName is required" });
     }
 
-    if (simulatedOperations.has(operationName)) {
-      return res.redirect(302, SANDBOX_VIDEO_URL);
-    }
-
-    const ai = getGenAI();
-    const updated = await ai.operations.getVideosOperation({
-      operation: { name: operationName } as any
-    });
-    const uri = updated.response?.generatedVideos?.[0]?.video?.uri;
-
-    if (!uri) {
-      if (
-        operationName.startsWith("/operations/op-demo-") ||
-        operationName === "/operations/op-compiled-film"
-      ) {
-        return res.redirect(302, SANDBOX_VIDEO_URL);
-      }
-      return res.status(404).json({ error: "Video uri not found yet." });
-    }
-
-    const videoRes = await fetch(uri, {
-      headers: { "x-goog-api-key": process.env.GEMINI_API_KEY || "" }
-    });
-
-    if (!videoRes.ok) {
-      return res.status(videoRes.status).json({ error: "Failed to fetch video from API." });
-    }
-
-    const ab = await videoRes.arrayBuffer();
-    const buf = Buffer.from(ab);
-
+    const buffer = await downloadOperationVideo(operationName);
     res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Length", buf.length);
-    res.send(buf);
+    res.setHeader("Content-Length", buffer.length);
+    res.send(buffer);
   } catch (error: any) {
     console.error("Video download error:", error);
     res.status(500).json({ error: error.message || "Failed to download video" });
