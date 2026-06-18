@@ -321,6 +321,15 @@ export default function App() {
     setOperationLogs((prev) => [`[${time}] ${message}`, ...prev.slice(0, 19)]);
   };
 
+  const readApiError = async (response: Response, fallback: string) => {
+    try {
+      const data = await response.json();
+      return data.error || fallback;
+    } catch {
+      return fallback;
+    }
+  };
+
   // Image Upload handler
   const handleImageUpload = (file: File) => {
     const reader = new FileReader();
@@ -498,7 +507,9 @@ export default function App() {
         })
       });
 
-      if (!response.ok) throw new Error("Video generation request failed");
+      if (!response.ok) {
+        throw new Error(await readApiError(response, "Video generation request failed"));
+      }
       const resData = await response.json();
 
       const opName = resData.operationName;
@@ -507,7 +518,8 @@ export default function App() {
         const updated = [...prev.scenes];
         updated[index] = {
           ...updated[index],
-          operationName: opName
+          operationName: opName,
+          renderedDuration: resData.durationSeconds
         };
         return { ...prev, scenes: updated };
       });
@@ -538,7 +550,7 @@ export default function App() {
         });
 
         if (!check.ok) {
-          throw new Error("Polling status error");
+          throw new Error(await readApiError(check, "Polling status error"));
         }
 
         const checkData = await check.json();
@@ -632,7 +644,9 @@ export default function App() {
             })
           });
 
-          if (!response.ok) throw new Error("Video generation request failed");
+          if (!response.ok) {
+            throw new Error(await readApiError(response, "Video generation request failed"));
+          }
           const resData = await response.json();
           const opName = resData.operationName;
 
@@ -643,7 +657,8 @@ export default function App() {
             if (currentScenes[index]) {
               currentScenes[index] = {
                 ...currentScenes[index],
-                operationName: opName
+                operationName: opName,
+                renderedDuration: resData.durationSeconds
               };
             }
             return { ...prev, scenes: currentScenes };
@@ -1622,7 +1637,7 @@ export default function App() {
                       <div className="space-y-1">
                         <span className="text-zinc-400 text-xs font-semibold uppercase flex items-center gap-1.5">
                           <Check className="w-3.5 h-3.5 text-indigo-400" />
-                          Voix off et Narration ({activeScene?.duration}s)
+                          Voix off et Narration ({activeScene?.renderedDuration || activeScene?.duration}s)
                         </span>
                         <p className="text-xs text-white leading-relaxed">
                           &ldquo;{activeScene?.narration}&rdquo;

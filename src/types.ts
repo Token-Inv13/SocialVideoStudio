@@ -27,6 +27,7 @@ export interface ScriptScene {
   videoUrl?: string;
   imageUrl?: string;
   operationName?: string;
+  renderedDuration?: number;
   error?: string;
 }
 

@@ -5,7 +5,7 @@ import { tmpdir } from "os";
 import path from "path";
 import { spawn } from "child_process";
 import dotenv from "dotenv";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GenerateVideosOperation, GoogleGenAI, Type } from "@google/genai";
 import { put } from "@vercel/blob";
 import ffmpegPath from "ffmpeg-static";
 
@@ -42,6 +42,21 @@ function getGenAI() {
     });
   }
   return aiInstance;
+}
+
+function normalizeVeoDurationSeconds(durationSeconds: unknown) {
+  const parsed =
+    typeof durationSeconds === "number" && Number.isFinite(durationSeconds)
+      ? Math.round(durationSeconds)
+      : 8;
+
+  return Math.min(8, Math.max(4, parsed));
+}
+
+function createVideoOperationHandle(operationName: string) {
+  const operation = new GenerateVideosOperation();
+  operation.name = operationName;
+  return operation;
 }
 
 function cleanupAssembledArtifacts() {
@@ -124,7 +139,7 @@ async function downloadOperationVideo(operationName: string) {
 
   const ai = getGenAI();
   const updated = await ai.operations.getVideosOperation({
-    operation: { name: operationName } as any,
+    operation: createVideoOperationHandle(operationName),
   });
   const uri = updated.response?.generatedVideos?.[0]?.video?.uri;
 
@@ -299,7 +314,8 @@ Category/Format details:
     const systemInstruction = `You are a world-class social media scripting director and video production planner.
 Your goal is to optimize the script structure:
 - If format starts with "Shorts", "Reels" or "TikTok" (usually 9:16 format), you MUST write a highly structured script that starts with an explosive, high-impact hook in the first 2 seconds to retain viewer attention. Keep total duration under 60 seconds (around 4-6 concise scenes).
-- If format is "YouTube (16:9)", structure the narrative as a compelling 3-act story (Introduction/Hook, Deep Dive/Conflict, Resolution/Outro). Keep durations around 10-15 seconds per scene for pacing.
+- If format is "YouTube (16:9)", structure the narrative as a compelling 3-act story (Introduction/Hook, Deep Dive/Conflict, Resolution/Outro).
+- Google Veo requires every individual scene duration to be between 4 and 8 seconds, inclusive. Never output a scene duration below 4 or above 8.
 - For each scene, write detailed image/video generation prompts (Visual prompts for GenAI models like Veo). Describe specific physical objects, lighting (e.g. dramatic volumetric light, cinematic golden hour), colors, actions, and specific camera styles (e.g., pan left, slow zoom-in, macro lens). Include audio directions (music/voice tones) and exactly what gets spoken. Use english for visual prompts so the video models understand them correctly.`;
 
     stage = "init_client";
@@ -450,9 +466,7 @@ app.post("/api/generate-video", async (req, res) => {
       resolution: "720p",
       aspectRatio: aspectRatio === "9:16" ? "9:16" : "16:9",
     };
-    if (typeof durationSeconds === "number" && Number.isFinite(durationSeconds)) {
-      config.durationSeconds = durationSeconds;
-    }
+    config.durationSeconds = normalizeVeoDurationSeconds(durationSeconds);
 
     const operation = await ai.models.generateVideos({
       model: model || "veo-3.1-lite-generate-preview",
@@ -461,7 +475,10 @@ app.post("/api/generate-video", async (req, res) => {
       config,
     });
 
-    res.json({ operationName: operation.name });
+    res.json({
+      operationName: operation.name,
+      durationSeconds: config.durationSeconds,
+    });
   } catch (error: any) {
     console.error("Veo video initiate error:", error);
     res.status(500).json({ error: error.message || "Failed to start Veo video generation" });
@@ -482,7 +499,7 @@ app.post("/api/video-status", async (req, res) => {
 
     const ai = getGenAI();
     const updated = await ai.operations.getVideosOperation({
-      operation: { name: operationName } as any,
+      operation: createVideoOperationHandle(operationName),
     });
     res.json({ done: updated.done, response: updated.response });
   } catch (error: any) {
@@ -562,7 +579,9 @@ app.get("/api/assembled-video/:artifactId", (req, res) => {
 
 app.all("/api/video-download", async (req, res) => {
   try {
-    const operationName = (req.method === "GET" ? req.query.operationName : req.body.operationName) as string;
+    const operationName = (req.method === "GET" || req.method === "HEAD"
+      ? req.query.operationName
+      : req.body.operationName) as string;
     if (!operationName) {
       return res.status(400).json({ error: "operationName is required" });
     }
