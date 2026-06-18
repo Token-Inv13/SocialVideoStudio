@@ -20,6 +20,8 @@ const assembledArtifacts = new Map<
   { buffer: Buffer; createdAt: number; filename: string }
 >();
 const ASSEMBLED_ARTIFACT_TTL_MS = 30 * 60 * 1000;
+const VEO_QUOTA_COOLDOWN_MS = 5 * 60 * 1000;
+let veoQuotaBlockedUntil = 0;
 
 app.use(express.json({ limit: "50mb" }));
 
@@ -48,6 +50,14 @@ function normalizeVeoDurationSeconds(durationSeconds: unknown) {
   // The current Veo 3.1 preview endpoint rejects some nominally valid values
   // below 8 seconds. Use the stable accepted duration to avoid partial renders.
   return 8;
+}
+
+function isVeoQuotaError(error: any) {
+  return error?.status === 429 || /RESOURCE_EXHAUSTED|quota|429/i.test(error?.message || "");
+}
+
+function getVeoQuotaRetryAfterSeconds() {
+  return Math.max(1, Math.ceil((veoQuotaBlockedUntil - Date.now()) / 1000));
 }
 
 function createVideoOperationHandle(operationName: string) {
@@ -446,6 +456,15 @@ app.post("/api/generate-video", async (req, res) => {
       return res.json({ operationName: createSimulatedVideoOperation(durationSeconds) });
     }
 
+    if (Date.now() < veoQuotaBlockedUntil) {
+      const retryAfterSeconds = getVeoQuotaRetryAfterSeconds();
+      res.setHeader("Retry-After", String(retryAfterSeconds));
+      return res.status(429).json({
+        error: `Quota Gemini/Veo temporairement atteint. Reessayez dans environ ${retryAfterSeconds}s.`,
+        retryAfterSeconds,
+      });
+    }
+
     const ai = getGenAI();
     let image;
     if (referenceImage) {
@@ -478,10 +497,16 @@ app.post("/api/generate-video", async (req, res) => {
     });
   } catch (error: any) {
     console.error("Veo video initiate error:", error);
-    const statusCode = error?.status === 429 || /RESOURCE_EXHAUSTED|quota|429/i.test(error?.message || "")
-      ? 429
-      : 500;
-    res.status(statusCode).json({ error: error.message || "Failed to start Veo video generation" });
+    if (isVeoQuotaError(error)) {
+      veoQuotaBlockedUntil = Date.now() + VEO_QUOTA_COOLDOWN_MS;
+      const retryAfterSeconds = getVeoQuotaRetryAfterSeconds();
+      res.setHeader("Retry-After", String(retryAfterSeconds));
+      return res.status(429).json({
+        error: `Quota Gemini/Veo atteint par Google. Reessayez dans environ ${retryAfterSeconds}s.`,
+        retryAfterSeconds,
+      });
+    }
+    res.status(500).json({ error: error.message || "Failed to start Veo video generation" });
   }
 });
 

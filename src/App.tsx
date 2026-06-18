@@ -327,11 +327,29 @@ export default function App() {
   const readApiError = async (response: Response, fallback: string) => {
     try {
       const data = await response.json();
-      return data.error || fallback;
+      return normalizeApiErrorMessage(data.error || fallback);
     } catch {
       return fallback;
     }
   };
+
+  const normalizeApiErrorMessage = (message: string) => {
+    if (!message) return "Erreur inconnue.";
+    try {
+      const parsed = JSON.parse(message);
+      return parsed?.error?.message || parsed?.message || message;
+    } catch {
+      return message;
+    }
+  };
+
+  const isQuotaErrorMessage = (message: string) =>
+    /429|quota|RESOURCE_EXHAUSTED|rate-limit|rate limit/i.test(message);
+
+  const getFriendlyQuotaMessage = (message: string) =>
+    isQuotaErrorMessage(message)
+      ? "Quota Gemini/Veo atteint. Attendez quelques minutes, puis relancez uniquement les clips manquants."
+      : message;
 
   const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -368,10 +386,14 @@ export default function App() {
         return await requestSceneVideoOperation(scene, index);
       } catch (err: any) {
         lastError = err instanceof Error ? err : new Error(String(err));
+        const isQuotaError = isQuotaErrorMessage(lastError.message);
+        if (isQuotaError) {
+          lastError = new Error(getFriendlyQuotaMessage(lastError.message));
+          break;
+        }
         if (attempt >= maxAttempts) break;
 
-        const isQuotaError = /429|quota|RESOURCE_EXHAUSTED/i.test(lastError.message);
-        const retryDelayMs = isQuotaError ? 65000 * attempt : 3500 * attempt;
+        const retryDelayMs = 3500 * attempt;
         addLog(
           `Tentative ${attempt}/${maxAttempts} Ã©chouÃ©e pour la ScÃ¨ne ${index + 1}. Nouvelle tentative dans ${Math.round(retryDelayMs / 1000)}s...`
         );
@@ -423,9 +445,12 @@ export default function App() {
         return { ...prev, scenes: updated };
       });
 
-      return await startPollingVideo(scene.id, opName, index);
+      const pollOk = await startPollingVideo(scene.id, opName, index);
+      return { ok: pollOk };
     } catch (err: any) {
-      const message = err?.message || "Impossible de lancer le rendu de ce clip.";
+      const rawMessage = err?.message || "Impossible de lancer le rendu de ce clip.";
+      const message = getFriendlyQuotaMessage(normalizeApiErrorMessage(rawMessage));
+      const quotaBlocked = isQuotaErrorMessage(rawMessage) || isQuotaErrorMessage(message);
       setScript((prev) => {
         if (!prev) return null;
         const updated = [...prev.scenes];
@@ -438,8 +463,24 @@ export default function App() {
         return { ...prev, scenes: updated };
       });
       addLog(`ERREUR d'initiation vidÃ©o ScÃ¨ne ${index + 1}: ${message}`);
-      return false;
+      return { ok: false, quotaBlocked };
     }
+  };
+
+  const markScenesBlockedByQuota = (sceneIndexes: number[], message: string) => {
+    setScript((prev) => {
+      if (!prev) return null;
+      const updated = [...prev.scenes];
+      sceneIndexes.forEach((sceneIndex) => {
+        if (!updated[sceneIndex] || updated[sceneIndex].videoUrl) return;
+        updated[sceneIndex] = {
+          ...updated[sceneIndex],
+          isGeneratingVideo: false,
+          error: message
+        };
+      });
+      return { ...prev, scenes: updated };
+    });
   };
 
   // Image Upload handler
@@ -684,7 +725,16 @@ export default function App() {
 
     for (let i = 0; i < updatedScenes.length; i++) {
       const scene = updatedScenes[i];
-      await renderSceneVideo(i, scene, { clearExistingVideo: true, queued: true });
+      const result = await renderSceneVideo(i, scene, { clearExistingVideo: true, queued: true });
+      if (result.quotaBlocked) {
+        const remainingIndexes = updatedScenes.map((_, index) => index).filter((index) => index > i);
+        markScenesBlockedByQuota(
+          remainingIndexes,
+          "Quota Gemini/Veo atteint. Relancez les clips manquants dans quelques minutes."
+        );
+        addLog("File de rendu stoppÃ©e temporairement : quota Gemini/Veo atteint.");
+        break;
+      }
       if (i < updatedScenes.length - 1) {
         await delay(simulateInSandbox ? 250 : 1500);
       }
@@ -705,7 +755,16 @@ export default function App() {
 
     for (let i = 0; i < scenesToRender.length; i++) {
       const { scene, index } = scenesToRender[i];
-      await renderSceneVideo(index, scene, { clearExistingVideo: true });
+      const result = await renderSceneVideo(index, scene, { clearExistingVideo: true });
+      if (result.quotaBlocked) {
+        const remainingIndexes = scenesToRender.slice(i + 1).map((item) => item.index);
+        markScenesBlockedByQuota(
+          remainingIndexes,
+          "Quota Gemini/Veo atteint. Relancez les clips manquants dans quelques minutes."
+        );
+        addLog("Relance stoppÃ©e temporairement : quota Gemini/Veo atteint.");
+        break;
+      }
       if (i < scenesToRender.length - 1) {
         await delay(simulateInSandbox ? 250 : 1500);
       }
