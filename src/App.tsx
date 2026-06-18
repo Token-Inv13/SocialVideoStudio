@@ -119,8 +119,11 @@ export default function App() {
   const totalSceneCount = script?.scenes.length ?? 0;
   const completedSceneCount = script?.scenes.filter((scene) => Boolean(scene.videoUrl)).length ?? 0;
   const failedSceneCount = script?.scenes.filter((scene) => Boolean(scene.error)).length ?? 0;
+  const missingSceneCount =
+    script?.scenes.filter((scene) => !scene.videoUrl && !scene.isGeneratingVideo).length ?? 0;
   const isProjectRendering = script?.scenes.some((scene) => scene.isGeneratingVideo) ?? false;
   const isProjectReady = totalSceneCount > 0 && completedSceneCount === totalSceneCount;
+  const canRetryMissingScenes = Boolean(script?.scenes.some((scene) => !scene.videoUrl && !scene.isGeneratingVideo));
   const activeScene: ScriptScene | undefined = script?.scenes[selectedSceneIndex];
   const isFinalVideoReady = Boolean(assembledVideoUrl);
   const displayedVideoUrl =
@@ -330,6 +333,115 @@ export default function App() {
     }
   };
 
+  const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const buildVideoRequestBody = (scene: ScriptScene, index: number) => ({
+    prompt: scene.visualPrompt,
+    aspectRatio: targetPlatform === "youtube" ? "16:9" : "9:16",
+    model: selectedModel,
+    durationSeconds: scene.duration,
+    sceneId: scene.id,
+    referenceImage: index === 0 ? referenceImage : null,
+    simulate: simulateInSandbox
+  });
+
+  const requestSceneVideoOperation = async (scene: ScriptScene, index: number) => {
+    const response = await fetch("/api/generate-video", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildVideoRequestBody(scene, index))
+    });
+
+    if (!response.ok) {
+      throw new Error(await readApiError(response, "Video generation request failed"));
+    }
+
+    return response.json() as Promise<{ operationName: string; durationSeconds?: number }>;
+  };
+
+  const requestSceneVideoOperationWithRetry = async (scene: ScriptScene, index: number) => {
+    const maxAttempts = simulateInSandbox ? 1 : 3;
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await requestSceneVideoOperation(scene, index);
+      } catch (err: any) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (attempt >= maxAttempts) break;
+
+        const isQuotaError = /429|quota|RESOURCE_EXHAUSTED/i.test(lastError.message);
+        const retryDelayMs = isQuotaError ? 65000 * attempt : 3500 * attempt;
+        addLog(
+          `Tentative ${attempt}/${maxAttempts} Ã©chouÃ©e pour la ScÃ¨ne ${index + 1}. Nouvelle tentative dans ${Math.round(retryDelayMs / 1000)}s...`
+        );
+        await delay(retryDelayMs);
+      }
+    }
+
+    throw lastError || new Error("Impossible d'initialiser le rendu vidÃ©o.");
+  };
+
+  const renderSceneVideo = async (
+    index: number,
+    scene: ScriptScene,
+    options: { clearExistingVideo?: boolean; queued?: boolean } = {}
+  ) => {
+    setScript((prev) => {
+      if (!prev) return null;
+      const updated = [...prev.scenes];
+      if (!updated[index]) return prev;
+      updated[index] = {
+        ...updated[index],
+        isGeneratingVideo: true,
+        error: undefined,
+        isSimulated: simulateInSandbox,
+        operationName: options.clearExistingVideo ? undefined : updated[index].operationName,
+        renderedDuration: options.clearExistingVideo ? undefined : updated[index].renderedDuration,
+        videoUrl: options.clearExistingVideo ? undefined : updated[index].videoUrl
+      };
+      return { ...prev, scenes: updated };
+    });
+
+    setRenderProgress((prev) => ({ ...prev, [scene.id]: options.queued ? 2 : 5 }));
+    addLog(`Initialisation du rendu vidÃ©o Veo pour la ScÃ¨ne ${index + 1}...`);
+
+    try {
+      const resData = await requestSceneVideoOperationWithRetry(scene, index);
+      const opName = resData.operationName;
+
+      setScript((prev) => {
+        if (!prev) return null;
+        const updated = [...prev.scenes];
+        if (!updated[index]) return prev;
+        updated[index] = {
+          ...updated[index],
+          operationName: opName,
+          renderedDuration: resData.durationSeconds,
+          error: undefined
+        };
+        return { ...prev, scenes: updated };
+      });
+
+      return await startPollingVideo(scene.id, opName, index);
+    } catch (err: any) {
+      const message = err?.message || "Impossible de lancer le rendu de ce clip.";
+      setScript((prev) => {
+        if (!prev) return null;
+        const updated = [...prev.scenes];
+        if (!updated[index]) return prev;
+        updated[index] = {
+          ...updated[index],
+          isGeneratingVideo: false,
+          error: message
+        };
+        return { ...prev, scenes: updated };
+      });
+      addLog(`ERREUR d'initiation vidÃ©o ScÃ¨ne ${index + 1}: ${message}`);
+      return false;
+    }
+  };
+
   // Image Upload handler
   const handleImageUpload = (file: File) => {
     const reader = new FileReader();
@@ -475,72 +587,13 @@ export default function App() {
     if (!script) return;
     const scene = script.scenes[index];
     resetFinalAssemblyState();
-
-    // Set interactive loader
-    setScript((prev) => {
-      if (!prev) return null;
-      const updated = [...prev.scenes];
-      updated[index] = {
-        ...updated[index],
-        isGeneratingVideo: true,
-        error: undefined,
-        videoUrl: undefined,
-        isSimulated: simulateInSandbox
-      };
-      return { ...prev, scenes: updated };
-    });
-    setRenderProgress((prev) => ({ ...prev, [scene.id]: 5 }));
-    addLog(`Initiation du rendu vidéo (Veo) pour la Scène ${index + 1}...`);
-
-    try {
-      const response = await fetch("/api/generate-video", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt: scene.visualPrompt,
-          aspectRatio: targetPlatform === "youtube" ? "16:9" : "9:16",
-          model: selectedModel,
-          durationSeconds: scene.duration,
-          sceneId: scene.id,
-          referenceImage: index === 0 ? referenceImage : null,
-          simulate: simulateInSandbox
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error(await readApiError(response, "Video generation request failed"));
-      }
-      const resData = await response.json();
-
-      const opName = resData.operationName;
-      setScript((prev) => {
-        if (!prev) return null;
-        const updated = [...prev.scenes];
-        updated[index] = {
-          ...updated[index],
-          operationName: opName,
-          renderedDuration: resData.durationSeconds
-        };
-        return { ...prev, scenes: updated };
-      });
-
-      // Trigger custom polling cycle
-      startPollingVideo(scene.id, opName, index);
-    } catch (err: any) {
-      setScript((prev) => {
-        if (!prev) return null;
-        const updated = [...prev.scenes];
-        updated[index] = { ...updated[index], isGeneratingVideo: false, error: err.message };
-        return { ...prev, scenes: updated };
-      });
-      addLog(`ERREUR d'initiation vidéo Scène ${index + 1}: ${err.message}`);
-    }
+    await renderSceneVideo(index, scene, { clearExistingVideo: true });
   };
-
   // 4. Poller status check
   const startPollingVideo = (sceneId: string, opName: string, index: number) => {
     let currentProgress = 5;
 
+    return new Promise<boolean>((resolve) => {
     const interval = setInterval(async () => {
       try {
         const check = await fetch("/api/video-status", {
@@ -577,27 +630,31 @@ export default function App() {
           });
 
           addLog(`Rendu vidéo de la Scène ${index + 1} complet et prêt au visionnage.`);
+          resolve(true);
         } else {
           // Increment progress indicators mock-responsively or retrieve from server if supported
           currentProgress = Math.min(95, currentProgress + 15);
           setRenderProgress((prev) => ({ ...prev, [sceneId]: currentProgress }));
           addLog(`Génération vidéo Scène ${index + 1}: ${currentProgress}%`);
         }
-      } catch (err) {
+      } catch (err: any) {
         clearInterval(interval);
-        addLog(`Erreur lors du suivi de rendu: Scène ${index + 1}`);
+        const message = err?.message || "La recuperation du flux video a rencontre une interruption.";
+        addLog(`Erreur lors du suivi de rendu Scene ${index + 1}: ${message}`);
         setScript((prevScript) => {
           if (!prevScript) return null;
           const updated = [...prevScript.scenes];
           updated[index] = {
             ...updated[index],
             isGeneratingVideo: false,
-            error: "La récupération du flux vidéo a rencontré une interruption."
+            error: message
           };
           return { ...prevScript, scenes: updated };
         });
+        resolve(false);
       }
     }, 2800);
+    });
   };
 
   // 5. Autogenerate/Render all elements in sequence (All script content workflow)
@@ -625,63 +682,33 @@ export default function App() {
     });
     setRenderProgress(initialProgress);
 
-    // Run parallel rendering fetches
     for (let i = 0; i < updatedScenes.length; i++) {
       const scene = updatedScenes[i];
-      (async (index: number, sc: any) => {
-        try {
-          const response = await fetch("/api/generate-video", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              prompt: sc.visualPrompt,
-              aspectRatio: targetPlatform === "youtube" ? "16:9" : "9:16",
-              model: selectedModel,
-              durationSeconds: sc.duration,
-              sceneId: sc.id,
-              referenceImage: index === 0 ? referenceImage : null,
-              simulate: simulateInSandbox
-            })
-          });
+      await renderSceneVideo(i, scene, { clearExistingVideo: true, queued: true });
+      if (i < updatedScenes.length - 1) {
+        await delay(simulateInSandbox ? 250 : 1500);
+      }
+    }
+  };
 
-          if (!response.ok) {
-            throw new Error(await readApiError(response, "Video generation request failed"));
-          }
-          const resData = await response.json();
-          const opName = resData.operationName;
+  const generateMissingVideos = async () => {
+    if (!script) return;
+    const scenesToRender = script.scenes
+      .map((scene, index) => ({ scene, index }))
+      .filter(({ scene }) => !scene.videoUrl && !scene.isGeneratingVideo);
 
-          // Add operation name to the specific scene
-          setScript((prev) => {
-            if (!prev) return null;
-            const currentScenes = [...prev.scenes];
-            if (currentScenes[index]) {
-              currentScenes[index] = {
-                ...currentScenes[index],
-                operationName: opName,
-                renderedDuration: resData.durationSeconds
-              };
-            }
-            return { ...prev, scenes: currentScenes };
-          });
+    if (!scenesToRender.length) return;
 
-          // Start polling for this specific scene
-          startPollingVideo(sc.id, opName, index);
-        } catch (err: any) {
-          setScript((prev) => {
-            if (!prev) return null;
-            const currentScenes = [...prev.scenes];
-            if (currentScenes[index]) {
-              currentScenes[index] = {
-                ...currentScenes[index],
-                isGeneratingVideo: false,
-                error: err.message
-              };
-            }
-            return { ...prev, scenes: currentScenes };
-          });
-          addLog(`ERREUR d'initiation vidéo Scène ${index + 1}: ${err.message}`);
-        }
-      })(i, scene);
+    projectCompletionAnnouncedRef.current = false;
+    resetFinalAssemblyState();
+    addLog(`Relance ciblee de ${scenesToRender.length} clip(s) manquant(s)...`);
+
+    for (let i = 0; i < scenesToRender.length; i++) {
+      const { scene, index } = scenesToRender[i];
+      await renderSceneVideo(index, scene, { clearExistingVideo: true });
+      if (i < scenesToRender.length - 1) {
+        await delay(simulateInSandbox ? 250 : 1500);
+      }
     }
   };
 
@@ -1559,6 +1586,16 @@ export default function App() {
                           Voir le Clip de Scène
                         </button>
                       )}
+                      {canRetryMissingScenes && (
+                        <button
+                          type="button"
+                          onClick={generateMissingVideos}
+                          className="bg-amber-600 hover:bg-amber-500 text-white text-xs px-3 py-1.5 rounded-lg inline-flex items-center gap-1.5 font-semibold cursor-pointer shadow-lg active:scale-95 transition-all"
+                        >
+                          <Sparkles className="w-3.5 h-3.5 text-white" />
+                          Relancer les clips manquants ({missingSceneCount})
+                        </button>
+                      )}
                       {sidebarMode === "expert" && (
                         <>
                           <button
@@ -1605,6 +1642,12 @@ export default function App() {
                   {simulateInSandbox && (
                     <div className="bg-amber-950/20 border border-amber-700/30 text-amber-200 text-xs rounded-lg p-3">
                       Mode sandbox actif : chaque scène réutilise volontairement le même clip de démonstration. Pour obtenir un rendu différent par scène, désactivez le sandbox avant de lancer la génération du projet.
+                    </div>
+                  )}
+
+                  {activeScene?.error && (
+                    <div className="bg-red-950/20 border border-red-700/30 text-red-200 text-xs rounded-lg p-3">
+                      Clip {selectedSceneIndex + 1} non finalise : {activeScene.error}
                     </div>
                   )}
 
@@ -1752,6 +1795,14 @@ export default function App() {
                       <div className="absolute inset-0 bg-emerald-950/20 flex items-center justify-center text-[10px] text-emerald-400 font-mono font-bold">
                         <Check className="w-3.5 h-3.5 text-emerald-400 mr-1" />
                         CLIP ok
+                      </div>
+                    ) : scene.isGeneratingVideo ? (
+                      <div className="absolute inset-0 bg-indigo-950/20 flex items-center justify-center text-[10px] text-indigo-300 font-mono font-bold">
+                        RENDU {renderProgress[scene.id] || 2}%
+                      </div>
+                    ) : scene.error ? (
+                      <div className="absolute inset-0 bg-red-950/20 flex items-center justify-center text-[10px] text-red-300 font-mono font-bold">
+                        A RELANCER
                       </div>
                     ) : scene.imageUrl ? (
                       <img

@@ -45,12 +45,9 @@ function getGenAI() {
 }
 
 function normalizeVeoDurationSeconds(durationSeconds: unknown) {
-  const parsed =
-    typeof durationSeconds === "number" && Number.isFinite(durationSeconds)
-      ? Math.round(durationSeconds)
-      : 8;
-
-  return Math.min(8, Math.max(4, parsed));
+  // The current Veo 3.1 preview endpoint rejects some nominally valid values
+  // below 8 seconds. Use the stable accepted duration to avoid partial renders.
+  return 8;
 }
 
 function createVideoOperationHandle(operationName: string) {
@@ -481,7 +478,10 @@ app.post("/api/generate-video", async (req, res) => {
     });
   } catch (error: any) {
     console.error("Veo video initiate error:", error);
-    res.status(500).json({ error: error.message || "Failed to start Veo video generation" });
+    const statusCode = error?.status === 429 || /RESOURCE_EXHAUSTED|quota|429/i.test(error?.message || "")
+      ? 429
+      : 500;
+    res.status(statusCode).json({ error: error.message || "Failed to start Veo video generation" });
   }
 });
 
